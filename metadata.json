@@ -1,0 +1,5 @@
+{
+  "name": "RealIntel AI",
+  "description": "Automated competitor tracking tool for real estate using Firecrawl and Gemini AI.",
+  "requestFramePermissions": []
+}

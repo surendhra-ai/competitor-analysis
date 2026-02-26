@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+@media print {
+  body {
+    background-color: white;
+  }
+  nav, .print-hidden {
+    display: none !important;
+  }
+  main {
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  .overflow-x-auto {
+    overflow: visible !important;
+  }
+  table {
+    page-break-inside: auto;
+  }
+  tr {
+    page-break-inside: avoid;
+    page-break-after: auto;
+  }
+}
