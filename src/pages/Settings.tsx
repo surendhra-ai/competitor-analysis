@@ -10,6 +10,7 @@ export default function SettingsPage() {
   const [llmModel, setLlmModel] = useState('gemini-3.1-pro-preview');
   const [geminiApiKey, setGeminiApiKey] = useState('');
   const [openaiApiKey, setOpenaiApiKey] = useState('');
+  const [reraSites, setReraSites] = useState('https://rera.telangana.gov.in/');
 
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
@@ -25,6 +26,7 @@ export default function SettingsPage() {
         if (data.llmModel) setLlmModel(data.llmModel);
         if (data.geminiApiKey) setGeminiApiKey(data.geminiApiKey);
         if (data.openaiApiKey) setOpenaiApiKey(data.openaiApiKey);
+        if (data.reraSites) setReraSites(data.reraSites);
       });
   }, []);
 
@@ -43,7 +45,8 @@ export default function SettingsPage() {
           llmProvider,
           llmModel,
           geminiApiKey,
-          openaiApiKey
+          openaiApiKey,
+          reraSites
         })
       });
       setMessage('Settings saved successfully.');
@@ -59,6 +62,9 @@ export default function SettingsPage() {
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-zinc-900">Settings</h1>
         <p className="text-zinc-500">Configure external integrations.</p>
+        <div className="mt-4 p-4 bg-blue-50 text-blue-800 text-sm rounded-lg border border-blue-200">
+          <strong>Note on Security:</strong> To keep your API keys secure, all settings on this page are stored locally in a secure SQLite database on the server, <strong>not</strong> in your public Supabase database.
+        </div>
       </div>
 
       <form onSubmit={handleSave} className="space-y-6">
@@ -216,6 +222,34 @@ export default function SettingsPage() {
             />
             <p className="mt-2 text-xs text-zinc-500">
               Get your API key from <a href="https://firecrawl.dev" target="_blank" rel="noreferrer" className="text-emerald-600 hover:underline">firecrawl.dev</a>
+            </p>
+          </div>
+        </div>
+
+        <div className="bg-white p-6 rounded-2xl shadow-sm border border-zinc-200 space-y-6">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="p-2 bg-blue-100 text-blue-600 rounded-lg">
+              <Database className="w-5 h-5" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-900">Search Grounding Configuration</h2>
+              <p className="text-sm text-zinc-500">Configure official sources for AI to search.</p>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-zinc-700 mb-2">
+              Official RERA Sites (Comma-separated)
+            </label>
+            <textarea 
+              className="w-full px-4 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none text-sm"
+              value={reraSites}
+              onChange={e => setReraSites(e.target.value)}
+              placeholder="https://rera.telangana.gov.in/, https://maharera.mahaonline.gov.in/"
+              rows={3}
+            />
+            <p className="mt-2 text-xs text-zinc-500">
+              The AI will prioritize these official RERA sites when searching for missing project details like prices, units, and handover dates.
             </p>
           </div>
         </div>

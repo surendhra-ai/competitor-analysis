@@ -17,6 +17,11 @@ db.exec(`
       key TEXT PRIMARY KEY,
       value TEXT
   );
+  CREATE TABLE IF NOT EXISTS weekly_updates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT,
+      data TEXT
+  );
   INSERT OR IGNORE INTO settings (key, value) VALUES ('supabaseUrl', 'https://supabase.trusync.cloud');
   INSERT OR IGNORE INTO settings (key, value) VALUES ('supabaseKey', 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc2MTE1NjAwMCwiZXhwIjo0OTE2ODI5NjAwLCJyb2xlIjoiYW5vbiJ9.-QMXM4M6Jpr2IYdpqd2QcUioKRz4b3N90c1Rxk_RUIM');
 `);
@@ -47,7 +52,7 @@ async function startServer() {
   });
 
   app.post('/api/settings', (req, res) => {
-    const { firecrawlApiKey, supabaseUrl, supabaseKey, llmProvider, llmModel, geminiApiKey, openaiApiKey } = req.body;
+    const { firecrawlApiKey, supabaseUrl, supabaseKey, llmProvider, llmModel, geminiApiKey, openaiApiKey, reraSites } = req.body;
     const stmt = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
     if (firecrawlApiKey !== undefined) stmt.run('firecrawlApiKey', firecrawlApiKey);
     if (supabaseUrl !== undefined) stmt.run('supabaseUrl', supabaseUrl);
@@ -56,7 +61,40 @@ async function startServer() {
     if (llmModel !== undefined) stmt.run('llmModel', llmModel);
     if (geminiApiKey !== undefined) stmt.run('geminiApiKey', geminiApiKey);
     if (openaiApiKey !== undefined) stmt.run('openaiApiKey', openaiApiKey);
+    if (reraSites !== undefined) stmt.run('reraSites', reraSites);
     res.json({ success: true });
+  });
+
+  // --- Weekly Updates ---
+  app.get('/api/weekly_updates', (req, res) => {
+    try {
+      const updates = db.prepare('SELECT * FROM weekly_updates ORDER BY timestamp DESC').all();
+      res.json(updates.map((u: any) => ({ ...u, data: JSON.parse(u.data) })));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/weekly_updates', (req, res) => {
+    try {
+      const { data } = req.body;
+      const timestamp = new Date().toISOString();
+      const stmt = db.prepare('INSERT INTO weekly_updates (timestamp, data) VALUES (?, ?)');
+      stmt.run(timestamp, JSON.stringify(data));
+      res.json({ success: true, timestamp });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete('/api/weekly_updates/:id', (req, res) => {
+    try {
+      const stmt = db.prepare('DELETE FROM weekly_updates WHERE id = ?');
+      stmt.run(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   // --- Projects ---
@@ -182,34 +220,44 @@ async function startServer() {
       const geminiApiKey = (settingsMap.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
       const openaiApiKey = (settingsMap.openaiApiKey || '').trim();
 
+      const reraSites = settingsMap.reraSites || 'https://rera.telangana.gov.in/';
+
       if (!firecrawlApiKey) {
         return res.status(400).json({ error: 'Firecrawl API Key is not set in settings.' });
       }
 
       // 1. Scrape using Firecrawl
       let scrapedText = '';
-      try {
-        const response = await fetch('https://api.firecrawl.dev/v1/scrape', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${firecrawlApiKey}`
-          },
-          body: JSON.stringify({
-            url: project.official_url,
-            formats: ['markdown']
-          })
-        });
+      const urlsToScrape = project.official_url.split(',').map((u: string) => u.trim()).filter((u: string) => u);
 
-        if (!response.ok) {
-          throw new Error(`Firecrawl API error: ${response.statusText}`);
+      for (const url of urlsToScrape) {
+        try {
+          const response = await fetch('https://api.firecrawl.dev/v1/scrape', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${firecrawlApiKey}`
+            },
+            body: JSON.stringify({
+              url: url,
+              formats: ['markdown']
+            })
+          });
+
+          if (!response.ok) {
+            console.error(`Firecrawl API error for ${url}: ${response.statusText}`);
+            continue;
+          }
+
+          const data = await response.json();
+          scrapedText += `\n\n--- Scraped from ${url} ---\n\n` + (data.data?.markdown || '');
+        } catch (error: any) {
+          console.error(`Scraping failed for ${url}:`, error);
         }
+      }
 
-        const data = await response.json();
-        scrapedText = data.data?.markdown || '';
-      } catch (error: any) {
-        console.error('Scraping failed:', error);
-        return res.status(500).json({ error: 'Failed to scrape website: ' + error.message });
+      if (!scrapedText.trim()) {
+        console.warn('Failed to scrape any URLs, proceeding with empty scraped text.');
       }
 
       // 1.5 Search Grounding with Gemini
@@ -222,26 +270,28 @@ async function startServer() {
             ${project.rera_registration_number ? `The RERA Registration Number is ${project.rera_registration_number}.` : ''}
             
             Please use the Google Search tool to find the most accurate information from:
-            1. Official TG RERA (Telangana RERA) website or other state RERA records.
-            2. Major property portals (MagicBricks, Housing.com, 99acres, SquareYards, PropTiger).
-            3. Official social media pages (Facebook, Instagram, YouTube), broker videos, or recent news articles for the project.
+            1. Official RERA websites, specifically prioritizing these sites: ${reraSites}. If a RERA number is provided, you MUST search for that exact number on the RERA site to find the official project details.
+            2. The official project microsite (${project.official_url})
+            3. Major property portals (MagicBricks, Housing.com, 99acres, SquareYards, PropTiger).
+            4. Official social media pages (Facebook, Instagram, YouTube), broker videos, or recent news articles for the project.
 
-            You MUST find and extract the following specific data points. If you don't find them in the first search, you must try different search queries (e.g., "${project.name} price per sqft", "${project.name} construction update 2025", "${project.name} possession date RERA", "${project.name} brochure pdf").
+            You MUST find and extract the following specific data points. If you don't find them in the first search, you must try different search queries (e.g., "${project.name} price per sqft", "${project.name} construction update 2025", "${project.name} possession date RERA", "${project.name} brochure pdf", "${project.rera_registration_number} RERA details").
 
             Data points to find:
             - Total Number of Units/Apartments
             - Number of Floors and Towers
             - Total Land Area in Acres
-            - Base Price per Sq.Ft (₹/sft) and Landed Price (₹/sft)
+            - Base Price per Sq.Ft (₹/sft) (Search for "base price", "BSP", "starting price per sqft". This is usually the lowest quoted price before amenities, floor rise, or car parking).
+            - Landed Price per Sq.Ft (₹/sft) or total package price (Search for "all inclusive price", "landed cost", "total price". This includes amenities, car parking, club house charges, etc. If you find a total package price like "1.5 Cr for 1500 sqft", calculate the landed price per sqft).
             - Current Construction Stage (e.g., Excavation, Foundation, Superstructure, Brickwork, Finishing)
-            - Expected Handover/Possession Date (Month and Year)
+            - Expected Handover/Possession Date (Month and Year) (explicitly search for "possession date", "handover by", "completion date")
             - Any active schemes, offers, or pre-launch benefits
             - Marketing focus or social media summary
 
-            Provide a highly detailed summary of your findings, explicitly mentioning the values for each of the data points above. If a value is an estimate or range, provide that. Do not just say "found on MagicBricks", actually provide the numbers and text.
+            CRITICAL INSTRUCTION: Do NOT guess or hallucinate numbers. If you cannot find a specific value, explicitly state "Not found". Provide a highly detailed summary of your findings, explicitly mentioning the values for each of the data points above. If a value is an estimate or range, provide that. Do not just say "found on MagicBricks", actually provide the numbers and text.
           `;
           const searchResponse = await searchAi.models.generateContent({
-            model: 'gemini-3-flash-preview',
+            model: 'gemini-3.1-pro-preview', // Upgraded to pro for better search reasoning
             contents: searchPrompt,
             config: {
               tools: [{ googleSearch: {} }]
@@ -249,7 +299,11 @@ async function startServer() {
           });
           searchSummary = searchResponse.text || '';
         }
-      } catch (searchError) {
+      } catch (searchError: any) {
+        const errorMsg = searchError?.message || String(searchError);
+        if (errorMsg.includes('API key not valid') || errorMsg.includes('API_KEY_INVALID')) {
+          return res.status(400).json({ error: 'Invalid Gemini API Key. Please configure a valid key in Settings.' });
+        }
         console.error('Search grounding failed, continuing without it:', searchError);
       }
 
@@ -284,7 +338,8 @@ async function startServer() {
             });
             return JSON.parse(aiResponse.text || '{}');
           } catch (error: any) {
-            if (error.message && error.message.includes('API key not valid')) {
+            const errorMsg = error?.message || String(error);
+            if (errorMsg.includes('API key not valid') || errorMsg.includes('API_KEY_INVALID')) {
               throw new Error('Invalid Gemini API Key. Please check your settings.');
             }
             throw error;
@@ -300,13 +355,15 @@ async function startServer() {
         
         Extract the following information. You MUST merge the data from both sources. If the official website text is vague or missing data, heavily rely on the Supplemental Web Search Summary (which contains RERA info, portal data, and social media updates).
         
+        CRITICAL: DO NOT GUESS OR HALLUCINATE VALUES. If a specific data point is not explicitly mentioned in either the scraped text or the search summary, you MUST return null for that field. Do not assume a default price like 8500 unless it is explicitly stated for this specific project.
+
         - Number of Units (integer, null if not found)
         - Number of Floors (integer, null if not found)
         - Land Area in Acres (number, null if not found)
-        - Base Price per Sft in Rs (number, null if not found. Extract approximate numerical value only, e.g., if "starts at 8,500/sqft", extract 8500. If a range is given, take the lower bound.)
-        - Landed Price per Sft in Rs (number, null if not found. Extract approximate numerical value only.)
+        - Base Price per Sft in Rs (number, null if not found. Extract approximate numerical value only. This is the raw price before amenities/parking. e.g., if "starts at 8,500/sqft", extract 8500. If a range is given, take the lower bound. Do NOT confuse with total package price.)
+        - Landed Price per Sft in Rs (number, null if not found. Extract approximate numerical value only. This is the all-inclusive price. If only total package price is given (e.g., 1.5 Cr for 1500 sqft), calculate the landed price per sqft (15000000/1500 = 10000). If you cannot confidently calculate it, return null.)
         - Construction Stage (short text, e.g., "Excavation", "Foundation", "Superstructure", "Finishing", null if not found)
-        - Handover Date (text, e.g., "Dec 2025", null if not found)
+        - Handover Date (text, e.g., "Dec 2025", null if not found. Look for "possession", "completion", or "handover".)
         - Schemes/Offers (array of strings, empty if none)
         - Social/Ads Summary (short text summarizing any marketing campaigns, broker videos, or social proof mentioned, null if not found)
 

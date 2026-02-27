@@ -17,7 +17,7 @@ export default function Projects() {
   const [scrapingIds, setScrapingIds] = useState<Set<string>>(new Set());
   const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [bulkProgress, setBulkProgress] = useState<{ current: number, total: number, projectName: string, success: number, fail: number } | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<{ current: number, total: number, projectName: string, success: number, fail: number, isComplete: boolean } | null>(null);
 
   const [formData, setFormData] = useState({
     name: '',
@@ -116,7 +116,7 @@ export default function Projects() {
     if (selectedProjects.size === 0) return;
     
     const projectArray = Array.from(selectedProjects);
-    setBulkProgress({ current: 0, total: projectArray.length, projectName: '', success: 0, fail: 0 });
+    setBulkProgress({ current: 0, total: projectArray.length, projectName: '', success: 0, fail: 0, isComplete: false });
 
     let successCount = 0;
     let failCount = 0;
@@ -134,10 +134,7 @@ export default function Projects() {
       setBulkProgress(prev => prev ? { ...prev, success: successCount, fail: failCount } : null);
     }
     
-    setTimeout(() => {
-      setBulkProgress(null);
-      alert(`Bulk Research Complete!\nSuccessful: ${successCount}\nFailed: ${failCount}`);
-    }, 1000);
+    setBulkProgress(prev => prev ? { ...prev, isComplete: true } : null);
     setSelectedProjects(new Set());
   };
 
@@ -227,15 +224,17 @@ export default function Projects() {
                 onChange={e => setFormData({...formData, location: e.target.value})}
               />
             </div>
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 mb-1">Official Website URL</label>
-              <input 
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium text-zinc-700 mb-1">Landing Page URLs (comma-separated)</label>
+              <textarea 
                 required
-                type="url" 
-                className="w-full px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
+                rows={2}
+                placeholder="https://project.com, https://project-landing.com"
+                className="w-full px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none resize-y"
                 value={formData.official_url}
                 onChange={e => setFormData({...formData, official_url: e.target.value})}
               />
+              <p className="text-xs text-zinc-500 mt-1">Add multiple URLs separated by commas to scrape more data sources.</p>
             </div>
             <div>
               <label className="block text-sm font-medium text-zinc-700 mb-1">RERA Number</label>
@@ -369,24 +368,40 @@ export default function Projects() {
         <div className="fixed bottom-6 right-6 bg-white p-5 rounded-xl shadow-2xl border border-zinc-200 z-50 min-w-[320px]">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-              <RefreshCw className="w-4 h-4 animate-spin text-emerald-600" />
-              Bulk Researching...
+              {bulkProgress.isComplete ? (
+                <span className="text-emerald-600 flex items-center gap-2">✅ Research Complete</span>
+              ) : (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin text-emerald-600" />
+                  Bulk Researching...
+                </>
+              )}
             </h3>
             <span className="text-xs font-medium text-zinc-500">{bulkProgress.current} / {bulkProgress.total}</span>
           </div>
-          <p className="text-xs text-zinc-600 mb-4 truncate" title={bulkProgress.projectName}>
-            Processing: <span className="font-semibold">{bulkProgress.projectName}</span>
-          </p>
+          {!bulkProgress.isComplete && (
+            <p className="text-xs text-zinc-600 mb-4 truncate" title={bulkProgress.projectName}>
+              Processing: <span className="font-semibold">{bulkProgress.projectName}</span>
+            </p>
+          )}
           <div className="w-full bg-zinc-100 rounded-full h-2 mb-3 overflow-hidden">
             <div 
-              className="bg-emerald-500 h-2 rounded-full transition-all duration-300 ease-out" 
+              className={`h-2 rounded-full transition-all duration-300 ease-out ${bulkProgress.isComplete ? 'bg-emerald-500' : 'bg-emerald-500'}`}
               style={{ width: `${(bulkProgress.current / bulkProgress.total) * 100}%` }}
             ></div>
           </div>
-          <div className="flex justify-between text-xs font-medium">
+          <div className="flex justify-between text-xs font-medium mb-3">
             <span className="text-emerald-600">Success: {bulkProgress.success}</span>
             <span className="text-red-600">Failed: {bulkProgress.fail}</span>
           </div>
+          {bulkProgress.isComplete && (
+            <button
+              onClick={() => setBulkProgress(null)}
+              className="w-full py-2 bg-zinc-100 text-zinc-700 rounded-lg hover:bg-zinc-200 text-sm font-medium transition-colors"
+            >
+              Close
+            </button>
+          )}
         </div>
       )}
     </div>
