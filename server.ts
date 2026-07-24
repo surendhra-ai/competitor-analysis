@@ -7,7 +7,7 @@ import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // We keep SQLite ONLY for local settings (API keys)
 const db = new Database('realintel.db');
@@ -26,6 +26,20 @@ db.exec(`
   INSERT OR IGNORE INTO settings (key, value) VALUES ('supabaseKey', 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc2MTE1NjAwMCwiZXhwIjo0OTE2ODI5NjAwLCJyb2xlIjoiYW5vbiJ9.-QMXM4M6Jpr2IYdpqd2QcUioKRz4b3N90c1Rxk_RUIM');
 `);
 
+// Auto-migrate legacy or high-tier Gemini models that exceed the free quota
+try {
+  const currentModelRow = db.prepare("SELECT value FROM settings WHERE key = 'llmModel'").get() as any;
+  if (currentModelRow) {
+    const modelVal = currentModelRow.value;
+    if (modelVal === 'gemini-3.1-pro-preview' || modelVal === 'gemini-3.5-flash' || modelVal === 'gemini-3-flash-preview' || modelVal === 'gemini-2.5-pro') {
+      console.log(`Migrating database model setting from '${modelVal}' to 'gemini-2.5-flash' to prevent quota issues.`);
+      db.prepare("UPDATE settings SET value = 'gemini-2.5-flash' WHERE key = 'llmModel'").run();
+    }
+  }
+} catch (e) {
+  console.error('Failed to run settings model migration:', e);
+}
+
 function getSupabase() {
   const urlRow = db.prepare("SELECT value FROM settings WHERE key = 'supabaseUrl'").get() as any;
   const keyRow = db.prepare("SELECT value FROM settings WHERE key = 'supabaseKey'").get() as any;
@@ -40,6 +54,14 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json());
+
+  app.get('/api/env-check', (req, res) => {
+    res.json({
+      gemini: !!process.env.GEMINI_API_KEY,
+      geminiVal: process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.substring(0, 5) : null,
+      api: !!process.env.API_KEY
+    });
+  });
 
   // --- Settings ---
   app.get('/api/settings', (req, res) => {
@@ -176,6 +198,21 @@ async function startServer() {
     }
   });
 
+  app.get('/api/snapshots/history', async (req, res) => {
+    try {
+      const supabase = getSupabase();
+      const { data, error } = await supabase
+        .from('project_snapshots')
+        .select('*')
+        .order('scraped_at', { ascending: true });
+        
+      if (error) throw error;
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   app.get('/api/deltas', async (req, res) => {
     try {
       const supabase = getSupabase();
@@ -205,6 +242,7 @@ async function startServer() {
         .single();
         
       if (projError || !project) {
+        console.error('Project not found in Supabase:', projError);
         return res.status(404).json({ error: 'Project not found in Supabase' });
       }
 
@@ -216,8 +254,28 @@ async function startServer() {
 
       const firecrawlApiKey = (settingsMap.firecrawlApiKey || '').trim();
       const llmProvider = settingsMap.llmProvider || 'gemini';
-      const llmModel = settingsMap.llmModel || 'gemini-3.1-pro-preview';
-      const geminiApiKey = (settingsMap.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+      let llmModel = settingsMap.llmModel || 'gemini-2.5-flash';
+
+      // Ensure we use gemini-2.5-flash for Gemini if the model name is legacy, paid, or incompatible
+      if (llmProvider === 'gemini') {
+        if (llmModel.includes('3.1') || llmModel.includes('3.5') || llmModel.includes('3-') || llmModel.includes('pro')) {
+          console.log(`Overriding Gemini model setting '${llmModel}' with 'gemini-2.5-flash' to avoid quota/tier limitations.`);
+          llmModel = 'gemini-2.5-flash';
+        }
+      }
+
+      let geminiApiKey = (settingsMap.geminiApiKey || '').trim();
+      if (geminiApiKey && !geminiApiKey.startsWith('AIzaSy')) {
+        console.warn(`Database geminiApiKey '${geminiApiKey}' does not start with AIzaSy. Ignoring and falling back to process.env.GEMINI_API_KEY.`);
+        geminiApiKey = '';
+      }
+      if (!geminiApiKey) {
+        geminiApiKey = (process.env.GEMINI_API_KEY || '').trim();
+      }
+      if (geminiApiKey === 'MY_GEMINI_API_KEY') {
+        geminiApiKey = '';
+      }
+      console.log('GEMINI API KEY IS:', geminiApiKey ? 'SET' : 'NOT SET', geminiApiKey ? geminiApiKey.substring(0, 5) : 'NONE');
       const openaiApiKey = (settingsMap.openaiApiKey || '').trim();
 
       const reraSites = settingsMap.reraSites || 'https://rera.telangana.gov.in/';
@@ -281,17 +339,17 @@ async function startServer() {
             - Total Number of Units/Apartments
             - Number of Floors and Towers
             - Total Land Area in Acres
-            - Base Price per Sq.Ft (₹/sft) (Search for "base price", "BSP", "starting price per sqft". This is usually the lowest quoted price before amenities, floor rise, or car parking).
-            - Landed Price per Sq.Ft (₹/sft) or total package price (Search for "all inclusive price", "landed cost", "total price". This includes amenities, car parking, club house charges, etc. If you find a total package price like "1.5 Cr for 1500 sqft", calculate the landed price per sqft).
+            - Base Price per Sq.Ft (₹/sft) (Search for "base price", "BSP", "starting price per sqft". This is usually the lowest quoted price before amenities, floor rise, or car parking. Do not confuse with total package price. If only a total package price is given and no per-sqft price is explicitly mentioned, state "Not found" for Base Price).
+            - Landed Price per Sq.Ft (₹/sft) or total package price (Search for "all inclusive price", "landed cost", "total price". This includes amenities, car parking, club house charges, etc. If you find a total package price like "1.5 Cr for 1500 sqft", calculate the landed price per sqft. If you cannot confidently calculate it because the exact area for that price is missing, state "Not found" for Landed Price).
             - Current Construction Stage (e.g., Excavation, Foundation, Superstructure, Brickwork, Finishing)
-            - Expected Handover/Possession Date (Month and Year) (explicitly search for "possession date", "handover by", "completion date")
+            - Expected Handover/Possession Date (Month and Year) (explicitly search for "possession date", "handover by", "completion date", or "RERA possession date". Ensure you extract the year and month if available. If multiple dates are found, prefer the RERA possession date or the latest completion date mentioned.)
             - Any active schemes, offers, or pre-launch benefits
             - Marketing focus or social media summary
 
             CRITICAL INSTRUCTION: Do NOT guess or hallucinate numbers. If you cannot find a specific value, explicitly state "Not found". Provide a highly detailed summary of your findings, explicitly mentioning the values for each of the data points above. If a value is an estimate or range, provide that. Do not just say "found on MagicBricks", actually provide the numbers and text.
           `;
           const searchResponse = await searchAi.models.generateContent({
-            model: 'gemini-3.1-pro-preview', // Upgraded to pro for better search reasoning
+            model: 'gemini-2.5-flash',
             contents: searchPrompt,
             config: {
               tools: [{ googleSearch: {} }]
@@ -300,11 +358,7 @@ async function startServer() {
           searchSummary = searchResponse.text || '';
         }
       } catch (searchError: any) {
-        const errorMsg = searchError?.message || String(searchError);
-        if (errorMsg.includes('API key not valid') || errorMsg.includes('API_KEY_INVALID')) {
-          return res.status(400).json({ error: 'Invalid Gemini API Key. Please configure a valid key in Settings.' });
-        }
-        console.error('Search grounding failed, continuing without it:', searchError);
+        console.error('Search grounding failed, continuing without it:', searchError?.message || String(searchError));
       }
 
       // Helper to call selected LLM
@@ -323,7 +377,13 @@ async function startServer() {
             messages: [{ role: 'user', content: promptWithSchema }],
             response_format: { type: 'json_object' }
           });
-          return JSON.parse(response.choices[0].message.content || '{}');
+          const content = response.choices[0].message.content || '{}';
+          try {
+            return JSON.parse(content);
+          } catch (e) {
+            console.error('Failed to parse OpenAI response:', content);
+            throw new Error('Failed to parse LLM response as JSON');
+          }
         } else {
           if (!geminiApiKey) throw new Error('Gemini API Key is not set. Please configure it in Settings or AI Studio Secrets.');
           const ai = new GoogleGenAI({ apiKey: geminiApiKey });
@@ -360,10 +420,10 @@ async function startServer() {
         - Number of Units (integer, null if not found)
         - Number of Floors (integer, null if not found)
         - Land Area in Acres (number, null if not found)
-        - Base Price per Sft in Rs (number, null if not found. Extract approximate numerical value only. This is the raw price before amenities/parking. e.g., if "starts at 8,500/sqft", extract 8500. If a range is given, take the lower bound. Do NOT confuse with total package price.)
-        - Landed Price per Sft in Rs (number, null if not found. Extract approximate numerical value only. This is the all-inclusive price. If only total package price is given (e.g., 1.5 Cr for 1500 sqft), calculate the landed price per sqft (15000000/1500 = 10000). If you cannot confidently calculate it, return null.)
+        - Base Price per Sft in Rs (number, null if not found. Extract approximate numerical value only. This is the raw price before amenities/parking. e.g., if "starts at 8,500/sqft", extract 8500. If a range is given, take the lower bound. Do NOT confuse with total package price. If only a total package price is given and no per-sqft price is explicitly mentioned, you MUST return null.)
+        - Landed Price per Sft in Rs (number, null if not found. Extract approximate numerical value only. This is the all-inclusive price. If only total package price is given (e.g., 1.5 Cr for 1500 sqft), calculate the landed price per sqft (15000000/1500 = 10000). If you cannot confidently calculate it because the exact area for that price is missing, you MUST return null. Do not guess or estimate.)
         - Construction Stage (short text, e.g., "Excavation", "Foundation", "Superstructure", "Finishing", null if not found)
-        - Handover Date (text, e.g., "Dec 2025", null if not found. Look for "possession", "completion", or "handover".)
+        - Handover Date (text, e.g., "Dec 2025", null if not found. Look for "possession", "completion", "handover", or "RERA possession date". Ensure you extract the year and month if available. If multiple dates are found, prefer the RERA possession date or the latest completion date mentioned.)
         - Schemes/Offers (array of strings, empty if none)
         - Social/Ads Summary (short text summarizing any marketing campaigns, broker videos, or social proof mentioned, null if not found)
 
@@ -393,17 +453,22 @@ async function startServer() {
       try {
         extractedData = await callLLM(prompt, extractionSchema);
       } catch (error: any) {
+        console.error('LLM extraction failed:', error);
         return res.status(400).json({ error: error.message });
       }
 
       // 3. Get previous snapshot to generate deltas
-      const { data: previousSnapshot } = await supabase
+      const { data: previousSnapshot, error: prevSnapError } = await supabase
         .from('project_snapshots')
         .select('*')
         .eq('project_id', project.id)
         .order('scraped_at', { ascending: false })
         .limit(1)
         .maybeSingle();
+
+      if (prevSnapError) {
+        console.error('Error fetching previous snapshot:', prevSnapError);
+      }
 
       // 4. Save new snapshot
       const { error: snapError } = await supabase.from('project_snapshots').insert([{
@@ -419,7 +484,10 @@ async function startServer() {
         social_ads_summary: extractedData.social_ads_summary
       }]);
       
-      if (snapError) throw snapError;
+      if (snapError) {
+        console.error('Error inserting new snapshot:', snapError);
+        throw snapError;
+      }
 
       // 5. Generate Incremental Updates (Weekly Deltas) using AI
       if (previousSnapshot) {

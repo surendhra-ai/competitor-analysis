@@ -7,7 +7,7 @@ export default function SettingsPage() {
   const [supabaseKey, setSupabaseKey] = useState('');
   
   const [llmProvider, setLlmProvider] = useState('gemini');
-  const [llmModel, setLlmModel] = useState('gemini-3.1-pro-preview');
+  const [llmModel, setLlmModel] = useState('gemini-2.5-flash');
   const [geminiApiKey, setGeminiApiKey] = useState('');
   const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [reraSites, setReraSites] = useState('https://rera.telangana.gov.in/');
@@ -131,7 +131,7 @@ export default function SettingsPage() {
                   value={llmProvider}
                   onChange={e => {
                     setLlmProvider(e.target.value);
-                    setLlmModel(e.target.value === 'gemini' ? 'gemini-3.1-pro-preview' : 'gpt-4o');
+                    setLlmModel(e.target.value === 'gemini' ? 'gemini-2.5-flash' : 'gpt-4o');
                   }}
                 >
                   <option value="gemini">Google Gemini</option>
@@ -149,8 +149,8 @@ export default function SettingsPage() {
                 >
                   {llmProvider === 'gemini' ? (
                     <>
-                      <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
-                      <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                      <option value="gemini-2.5-flash">Gemini 2.5 Flash (Free / Default)</option>
+                      <option value="gemini-2.5-pro">Gemini 2.5 Pro (Paid)</option>
                     </>
                   ) : (
                     <>
@@ -174,6 +174,11 @@ export default function SettingsPage() {
                   onChange={e => setGeminiApiKey(e.target.value)}
                   placeholder="Leave empty to use AI Studio Secrets (GEMINI_API_KEY)"
                 />
+                {geminiApiKey && !geminiApiKey.startsWith('AIzaSy') && (
+                  <p className="mt-2 text-xs text-amber-600 font-medium">
+                    ⚠️ Warning: This doesn't look like a valid Gemini API Key (typically starts with "AIzaSy"). Please make sure you entered your API Key, not your Google Cloud Project ID.
+                  </p>
+                )}
                 <p className="mt-2 text-xs text-zinc-500">
                   If left empty, the system will use the default GEMINI_API_KEY from your AI Studio Secrets panel.
                 </p>

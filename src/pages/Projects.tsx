@@ -125,16 +125,23 @@ export default function Projects() {
     for (let i = 0; i < projectArray.length; i++) {
       const id = projectArray[i];
       const project = projects.find(p => p.id === id);
+      
+      // Update progress to show which project is currently being processed
       setBulkProgress(prev => prev ? { ...prev, current: i + 1, projectName: project?.name || 'Unknown' } : null);
 
       const success = await handleScrape(id, false);
-      if (success) successCount++;
-      else failCount++;
+      
+      if (success) {
+        successCount++;
+      } else {
+        failCount++;
+      }
 
+      // Update progress immediately after each project finishes to show live success/fail counts
       setBulkProgress(prev => prev ? { ...prev, success: successCount, fail: failCount } : null);
     }
     
-    setBulkProgress(prev => prev ? { ...prev, isComplete: true } : null);
+    setBulkProgress(prev => prev ? { ...prev, isComplete: true, projectName: 'All projects processed' } : null);
     setSelectedProjects(new Set());
   };
 

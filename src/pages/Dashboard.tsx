@@ -161,10 +161,101 @@ export default function Dashboard() {
     if (!tableRef.current) return;
     setGeneratingPdf(true);
     try {
+      const oklchToRgb = (oklchContent: string): string => {
+        const trimmed = oklchContent.trim();
+        const parts = trimmed.split(/[\s,/]+/);
+        if (parts.length === 0) return 'rgb(128, 128, 128)';
+        
+        const lightnessStr = parts[0];
+        let l = 0.5;
+        if (lightnessStr.endsWith('%')) {
+          l = parseFloat(lightnessStr) / 100;
+        } else {
+          l = parseFloat(lightnessStr);
+        }
+        
+        if (isNaN(l)) l = 0.5;
+        l = Math.max(0, Math.min(1, l));
+        
+        const val = Math.round(l * 255);
+        
+        let alpha = '';
+        const slashIndex = trimmed.indexOf('/');
+        if (slashIndex !== -1) {
+          const alphaStr = trimmed.substring(slashIndex + 1).trim();
+          const alphaVal = parseFloat(alphaStr);
+          if (!isNaN(alphaVal)) {
+            alpha = `, ${alphaVal}`;
+          }
+        }
+        
+        if (alpha) {
+          return `rgba(${val}, ${val}, ${val}${alpha})`;
+        } else {
+          return `rgb(${val}, ${val}, ${val})`;
+        }
+      };
+
+      const sanitizeCssForHtml2Canvas = (cssText: string): string => {
+        let result = '';
+        let i = 0;
+        while (i < cssText.length) {
+          const oklchIndex = cssText.indexOf('oklch(', i);
+          if (oklchIndex === -1) {
+            result += cssText.substring(i);
+            break;
+          }
+          
+          result += cssText.substring(i, oklchIndex);
+          let parenCount = 1;
+          let j = oklchIndex + 6;
+          while (j < cssText.length && parenCount > 0) {
+            if (cssText[j] === '(') {
+              parenCount++;
+            } else if (cssText[j] === ')') {
+              parenCount--;
+            }
+            j++;
+          }
+          
+          const oklchContent = cssText.substring(oklchIndex + 6, j - 1);
+          result += oklchToRgb(oklchContent);
+          i = j;
+        }
+        return result;
+      };
+
       const canvas = await html2canvas(tableRef.current, {
         scale: 2,
         useCORS: true,
-        logging: false
+        logging: false,
+        onclone: (clonedDoc) => {
+          let sanitizedCss = '';
+          for (let i = 0; i < document.styleSheets.length; i++) {
+            const sheet = document.styleSheets[i];
+            try {
+              let sheetCss = '';
+              if (sheet.cssRules) {
+                for (let j = 0; j < sheet.cssRules.length; j++) {
+                  sheetCss += sheet.cssRules[j].cssText + '\n';
+                }
+              }
+              sanitizedCss += sanitizeCssForHtml2Canvas(sheetCss) + '\n';
+            } catch (e) {
+              console.warn('Could not read styleRules from stylesheet', e);
+            }
+          }
+          
+          const clonedLinks = clonedDoc.querySelectorAll('link[rel="stylesheet"]');
+          clonedLinks.forEach(link => link.remove());
+          
+          const clonedStyles = clonedDoc.querySelectorAll('style');
+          clonedStyles.forEach(style => style.remove());
+          
+          const newStyle = clonedDoc.createElement('style');
+          newStyle.textContent = sanitizedCss;
+          clonedDoc.head.appendChild(newStyle);
+        }
       });
       const imgData = canvas.toDataURL('image/png');
       const pdf = new jsPDF({

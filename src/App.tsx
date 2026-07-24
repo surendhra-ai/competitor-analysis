@@ -1,7 +1,8 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router';
-import { LayoutDashboard, Settings, Building2, Activity } from 'lucide-react';
+import { LayoutDashboard, Settings, Building2, Activity, TrendingUp } from 'lucide-react';
 import { cn } from './lib/utils';
 import Dashboard from './pages/Dashboard';
+import Analytics from './pages/Analytics';
 import Projects from './pages/Projects';
 import SettingsPage from './pages/Settings';
 import Deltas from './pages/Deltas';
@@ -11,6 +12,7 @@ function Sidebar() {
   
   const navItems = [
     { icon: LayoutDashboard, label: 'Comparison', path: '/' },
+    { icon: TrendingUp, label: 'Analytics & Trends', path: '/analytics' },
     { icon: Building2, label: 'Projects', path: '/projects' },
     { icon: Activity, label: 'Weekly Updates', path: '/deltas' },
     { icon: Settings, label: 'Settings', path: '/settings' },
@@ -59,6 +61,7 @@ export default function App() {
         <main className="flex-1 overflow-auto">
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/analytics" element={<Analytics />} />
             <Route path="/projects" element={<Projects />} />
             <Route path="/deltas" element={<Deltas />} />
             <Route path="/settings" element={<SettingsPage />} />
