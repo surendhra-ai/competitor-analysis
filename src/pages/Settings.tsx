@@ -149,13 +149,22 @@ export default function SettingsPage() {
                 >
                   {llmProvider === 'gemini' ? (
                     <>
-                      <option value="gemini-2.5-flash">Gemini 2.5 Flash (Free / Default)</option>
-                      <option value="gemini-2.5-pro">Gemini 2.5 Pro (Paid)</option>
+                      <option value="gemini-2.5-flash">Gemini 2.5 Flash (Default / Recommended)</option>
+                      <option value="gemini-3.6-flash">Gemini 3.6 Flash (Latest Ultra-Fast)</option>
+                      <option value="gemini-3.5-flash">Gemini 3.5 Flash (High Efficiency)</option>
+                      <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview (Complex Reasoning)</option>
+                      <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite (Lightweight)</option>
+                      <option value="gemini-2.5-pro">Gemini 2.5 Pro (Advanced Logic)</option>
+                      <option value="gemini-flash-latest">Gemini Flash Latest</option>
                     </>
                   ) : (
                     <>
-                      <option value="gpt-4o">GPT-4o</option>
-                      <option value="gpt-4o-mini">GPT-4o Mini</option>
+                      <option value="gpt-4o">GPT-4o (Flagship Multimodal / Default)</option>
+                      <option value="gpt-4o-mini">GPT-4o Mini (Fast & Cost-Effective)</option>
+                      <option value="gpt-4.5-preview">GPT-4.5 Preview (Next-Gen Knowledge)</option>
+                      <option value="o3-mini">o3-mini (Latest STEM & Fast Reasoning)</option>
+                      <option value="o1">o1 (Deep Reasoning Engine)</option>
+                      <option value="o1-mini">o1-mini (Fast Coding & Logic)</option>
                     </>
                   )}
                 </select>

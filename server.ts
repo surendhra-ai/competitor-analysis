@@ -40,6 +40,86 @@ try {
   console.error('Failed to run settings model migration:', e);
 }
 
+async function scrapeUrlWithFallback(url: string, firecrawlApiKey: string): Promise<string> {
+  // 1. Try Firecrawl if key is provided
+  if (firecrawlApiKey) {
+    try {
+      const response = await fetch('https://api.firecrawl.dev/v1/scrape', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${firecrawlApiKey}`
+        },
+        body: JSON.stringify({
+          url: url,
+          formats: ['markdown']
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const markdown = data.data?.markdown || '';
+        if (markdown.trim()) {
+          console.log(`Successfully scraped ${url} using Firecrawl API.`);
+          return markdown;
+        }
+      } else {
+        console.warn(`Firecrawl API for ${url} returned ${response.status} ${response.statusText}. Trying fallback scrapers...`);
+      }
+    } catch (err: any) {
+      console.warn(`Firecrawl request for ${url} failed: ${err.message || err}. Trying fallback scrapers...`);
+    }
+  }
+
+  // 2. Fallback 1: Jina Reader API
+  try {
+    console.log(`Attempting Jina Reader fallback for ${url}...`);
+    const jinaRes = await fetch(`https://r.jina.ai/${encodeURIComponent(url)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/plain'
+      }
+    });
+    if (jinaRes.ok) {
+      const text = await jinaRes.text();
+      if (text.trim() && !text.includes('403 Forbidden') && !text.includes('Access Denied')) {
+        console.log(`Successfully scraped ${url} via Jina Reader fallback (${text.length} chars).`);
+        return text;
+      }
+    }
+  } catch (jinaErr: any) {
+    console.warn(`Jina Reader fallback failed for ${url}:`, jinaErr.message || jinaErr);
+  }
+
+  // 3. Fallback 2: Direct HTML Fetch & text extraction
+  try {
+    console.log(`Attempting direct HTML fetch for ${url}...`);
+    const directRes = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+    if (directRes.ok) {
+      const html = await directRes.text();
+      const cleanText = html
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
+        .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (cleanText.length > 100) {
+        console.log(`Successfully extracted ${cleanText.length} chars from ${url} via direct HTML fetch.`);
+        return cleanText.slice(0, 15000);
+      }
+    }
+  } catch (directErr: any) {
+    console.warn(`Direct fetch fallback failed for ${url}:`, directErr.message || directErr);
+  }
+
+  return '';
+}
+
 function getSupabase() {
   const urlRow = db.prepare("SELECT value FROM settings WHERE key = 'supabaseUrl'").get() as any;
   const keyRow = db.prepare("SELECT value FROM settings WHERE key = 'supabaseKey'").get() as any;
@@ -254,15 +334,7 @@ async function startServer() {
 
       const firecrawlApiKey = (settingsMap.firecrawlApiKey || '').trim();
       const llmProvider = settingsMap.llmProvider || 'gemini';
-      let llmModel = settingsMap.llmModel || 'gemini-2.5-flash';
-
-      // Ensure we use gemini-2.5-flash for Gemini if the model name is legacy, paid, or incompatible
-      if (llmProvider === 'gemini') {
-        if (llmModel.includes('3.1') || llmModel.includes('3.5') || llmModel.includes('3-') || llmModel.includes('pro')) {
-          console.log(`Overriding Gemini model setting '${llmModel}' with 'gemini-2.5-flash' to avoid quota/tier limitations.`);
-          llmModel = 'gemini-2.5-flash';
-        }
-      }
+      let llmModel = settingsMap.llmModel || (llmProvider === 'openai' ? 'gpt-4o' : 'gemini-2.5-flash');
 
       let geminiApiKey = (settingsMap.geminiApiKey || '').trim();
       if (geminiApiKey && !geminiApiKey.startsWith('AIzaSy')) {
@@ -280,42 +352,23 @@ async function startServer() {
 
       const reraSites = settingsMap.reraSites || 'https://rera.telangana.gov.in/';
 
-      if (!firecrawlApiKey) {
-        return res.status(400).json({ error: 'Firecrawl API Key is not set in settings.' });
-      }
-
-      // 1. Scrape using Firecrawl
+      // 1. Scrape using Firecrawl with automatic fallbacks (Jina Reader / Direct Fetch)
       let scrapedText = '';
       const urlsToScrape = project.official_url.split(',').map((u: string) => u.trim()).filter((u: string) => u);
 
       for (const url of urlsToScrape) {
         try {
-          const response = await fetch('https://api.firecrawl.dev/v1/scrape', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${firecrawlApiKey}`
-            },
-            body: JSON.stringify({
-              url: url,
-              formats: ['markdown']
-            })
-          });
-
-          if (!response.ok) {
-            console.error(`Firecrawl API error for ${url}: ${response.statusText}`);
-            continue;
+          const content = await scrapeUrlWithFallback(url, firecrawlApiKey);
+          if (content) {
+            scrapedText += `\n\n--- Scraped from ${url} ---\n\n` + content;
           }
-
-          const data = await response.json();
-          scrapedText += `\n\n--- Scraped from ${url} ---\n\n` + (data.data?.markdown || '');
         } catch (error: any) {
-          console.error(`Scraping failed for ${url}:`, error);
+          console.warn(`Scraping attempt failed for ${url}:`, error.message || error);
         }
       }
 
       if (!scrapedText.trim()) {
-        console.warn('Failed to scrape any URLs, proceeding with empty scraped text.');
+        console.warn('Direct website scraping returned no text; proceeding with Gemini Search Grounding.');
       }
 
       // 1.5 Search Grounding with Gemini
@@ -372,17 +425,26 @@ async function startServer() {
           
           const promptWithSchema = promptText + "\n\nReturn ONLY valid JSON matching this schema:\n" + schemaString;
           
-          const response = await openai.chat.completions.create({
-            model: llmModel,
-            messages: [{ role: 'user', content: promptWithSchema }],
-            response_format: { type: 'json_object' }
-          });
-          const content = response.choices[0].message.content || '{}';
           try {
+            const response = await openai.chat.completions.create({
+              model: llmModel,
+              messages: [{ role: 'user', content: promptWithSchema }],
+              response_format: { type: 'json_object' }
+            });
+            const content = response.choices[0].message.content || '{}';
             return JSON.parse(content);
-          } catch (e) {
-            console.error('Failed to parse OpenAI response:', content);
-            throw new Error('Failed to parse LLM response as JSON');
+          } catch (error: any) {
+            console.warn(`OpenAI model '${llmModel}' failed: ${error?.message || error}. Attempting fallback to gpt-4o-mini...`);
+            if (llmModel !== 'gpt-4o-mini') {
+              const fallbackRes = await openai.chat.completions.create({
+                model: 'gpt-4o-mini',
+                messages: [{ role: 'user', content: promptWithSchema }],
+                response_format: { type: 'json_object' }
+              });
+              const fbContent = fallbackRes.choices[0].message.content || '{}';
+              return JSON.parse(fbContent);
+            }
+            throw error;
           }
         } else {
           if (!geminiApiKey) throw new Error('Gemini API Key is not set. Please configure it in Settings or AI Studio Secrets.');
@@ -401,6 +463,18 @@ async function startServer() {
             const errorMsg = error?.message || String(error);
             if (errorMsg.includes('API key not valid') || errorMsg.includes('API_KEY_INVALID')) {
               throw new Error('Invalid Gemini API Key. Please check your settings.');
+            }
+            if ((errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('not found') || errorMsg.includes('Quota')) && llmModel !== 'gemini-2.5-flash') {
+              console.warn(`Gemini model '${llmModel}' failed with quota/compatibility error. Falling back to gemini-2.5-flash...`);
+              const fallbackResponse = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: promptText,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: schema
+                }
+              });
+              return JSON.parse(fallbackResponse.text || '{}');
             }
             throw error;
           }
