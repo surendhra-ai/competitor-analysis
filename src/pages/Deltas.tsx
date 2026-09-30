@@ -52,12 +52,14 @@ export default function Deltas() {
       const projectsData = await projectsRes.json();
       
       const projMap: Record<string, string> = {};
-      projectsData.forEach((p: Project) => {
-        projMap[p.id] = p.name;
-      });
+      if (Array.isArray(projectsData)) {
+        projectsData.forEach((p: Project) => {
+          projMap[p.id] = p.name;
+        });
+      }
       
       setProjects(projMap);
-      setDeltas(deltasData);
+      setDeltas(Array.isArray(deltasData) ? deltasData : []);
     } catch (error) {
       console.error('Failed to fetch deltas', error);
     } finally {

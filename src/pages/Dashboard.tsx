@@ -59,9 +59,13 @@ export default function Dashboard() {
         fetch('/api/projects'),
         fetch('/api/snapshots/latest')
       ]);
-      const fetchedProjects = await projectsRes.json();
+      const projectsData = await projectsRes.json();
+      const snapshotsData = await snapshotsRes.json();
+      const fetchedProjects = Array.isArray(projectsData) ? projectsData : [];
+      const fetchedSnapshots = Array.isArray(snapshotsData) ? snapshotsData : [];
+
       setProjects(fetchedProjects);
-      setSnapshots(await snapshotsRes.json());
+      setSnapshots(fetchedSnapshots);
 
       const savedView = localStorage.getItem('dashboardView');
       if (savedView) {
