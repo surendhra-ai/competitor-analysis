@@ -606,6 +606,157 @@ async function startServer() {
     }
   });
 
+  // --- Firecrawl Connection Test & Status ---
+  app.post('/api/firecrawl/test', async (req, res) => {
+    let key = (req.body?.apiKey || '').trim();
+    if (!key) {
+      const row = db.prepare("SELECT value FROM settings WHERE key = 'firecrawlApiKey'").get() as any;
+      key = (row?.value || process.env.FIRECRAWL_API_KEY || '').trim();
+    }
+
+    if (!key) {
+      return res.json({
+        success: false,
+        connected: false,
+        status: 'unconfigured',
+        error: 'No Firecrawl API key configured.'
+      });
+    }
+
+    const startTime = Date.now();
+    try {
+      // 1. Try lightweight credit-usage endpoint
+      const creditRes = await fetch('https://api.firecrawl.dev/v1/team/credit-usage', {
+        headers: { 'Authorization': `Bearer ${key}` }
+      });
+
+      const latencyMs = Date.now() - startTime;
+      if (creditRes.ok) {
+        const usageData = await creditRes.json().catch(() => ({}));
+        return res.json({
+          success: true,
+          connected: true,
+          status: 'connected',
+          latencyMs,
+          message: 'Firecrawl API is connected and active.',
+          data: usageData?.data || usageData
+        });
+      }
+
+      if (creditRes.status === 401 || creditRes.status === 403) {
+        return res.json({
+          success: false,
+          connected: false,
+          status: 'invalid_key',
+          latencyMs,
+          error: 'Authentication failed: Invalid Firecrawl API key (401 Unauthorized).'
+        });
+      }
+
+      // 2. Fallback: lightweight test scrape
+      const pingRes = await fetch('https://api.firecrawl.dev/v1/scrape', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`
+        },
+        body: JSON.stringify({ url: 'https://example.com' })
+      });
+      const pingLatency = Date.now() - startTime;
+
+      if (pingRes.ok) {
+        return res.json({
+          success: true,
+          connected: true,
+          status: 'connected',
+          latencyMs: pingLatency,
+          message: 'Firecrawl API connected and verified.'
+        });
+      } else if (pingRes.status === 401 || pingRes.status === 403) {
+        return res.json({
+          success: false,
+          connected: false,
+          status: 'invalid_key',
+          latencyMs: pingLatency,
+          error: 'Authentication failed: Invalid Firecrawl API key (401 Unauthorized).'
+        });
+      } else {
+        const errJson = await pingRes.json().catch(() => ({}));
+        return res.json({
+          success: false,
+          connected: false,
+          status: 'error',
+          latencyMs: pingLatency,
+          error: errJson.error || `Firecrawl API returned HTTP ${pingRes.status}`
+        });
+      }
+    } catch (err: any) {
+      const latencyMs = Date.now() - startTime;
+      return res.json({
+        success: false,
+        connected: false,
+        status: 'error',
+        latencyMs,
+        error: err.message || 'Network error reaching Firecrawl API.'
+      });
+    }
+  });
+
+  app.get('/api/firecrawl/status', async (req, res) => {
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'firecrawlApiKey'").get() as any;
+    const key = (row?.value || process.env.FIRECRAWL_API_KEY || '').trim();
+    if (!key) {
+      return res.json({
+        configured: false,
+        connected: false,
+        status: 'unconfigured',
+        message: 'No Firecrawl API key configured. Built-in fallback scrapers (Jina Reader & Direct Fetch) are active.'
+      });
+    }
+
+    const startTime = Date.now();
+    try {
+      const creditRes = await fetch('https://api.firecrawl.dev/v1/team/credit-usage', {
+        headers: { 'Authorization': `Bearer ${key}` }
+      });
+      const latencyMs = Date.now() - startTime;
+      if (creditRes.ok) {
+        const usageData = await creditRes.json().catch(() => ({}));
+        return res.json({
+          configured: true,
+          connected: true,
+          status: 'connected',
+          latencyMs,
+          message: 'Firecrawl API is connected and ready.',
+          data: usageData?.data || usageData
+        });
+      } else if (creditRes.status === 401 || creditRes.status === 403) {
+        return res.json({
+          configured: true,
+          connected: false,
+          status: 'invalid_key',
+          latencyMs,
+          error: 'Invalid Firecrawl API key (401 Unauthorized).'
+        });
+      } else {
+        return res.json({
+          configured: true,
+          connected: false,
+          status: 'error',
+          latencyMs,
+          error: `Firecrawl returned status ${creditRes.status}.`
+        });
+      }
+    } catch (err: any) {
+      return res.json({
+        configured: true,
+        connected: false,
+        status: 'error',
+        error: err.message || 'Failed to ping Firecrawl API.'
+      });
+    }
+  });
+
   // --- LLM Test Connection ---
   app.post('/api/llm/test', async (req, res) => {
     const { llmBaseUrl, llmModel, llmApiKey, geminiApiKey } = req.body;

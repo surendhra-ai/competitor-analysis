@@ -17,22 +17,12 @@ import {
   RefreshCw,
   HardDrive
 } from 'lucide-react';
-
-interface SupabaseStatus {
-  configured: boolean;
-  connected: boolean;
-  source?: string;
-  url?: string;
-  localProjectCount?: number;
-  tables?: {
-    projects: boolean;
-    project_snapshots: boolean;
-    weekly_deltas: boolean;
-  };
-  projectCount?: number;
-  error?: string | null;
-  schemaSql?: string;
-}
+import { 
+  verifySupabaseConnection, 
+  type SupabasePingResult,
+  verifyFirecrawlConnection,
+  type FirecrawlPingResult 
+} from '../lib/supabase';
 
 async function fetchJsonSafely(res: Response) {
   const text = await res.text();
@@ -49,15 +39,19 @@ async function fetchJsonSafely(res: Response) {
 export default function Settings() {
   const [apiKey, setApiKey] = useState('');
   
-  // Supabase Settings
+  // Supabase Settings & Verification
   const [supabaseUrl, setSupabaseUrl] = useState('');
   const [supabaseKey, setSupabaseKey] = useState('');
-  const [supabaseStatus, setSupabaseStatus] = useState<SupabaseStatus | null>(null);
+  const [supabasePing, setSupabasePing] = useState<SupabasePingResult | null>(null);
   const [testingSupabase, setTestingSupabase] = useState(false);
   const [showSqlSchema, setShowSqlSchema] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
+
+  // Firecrawl Settings & Verification
+  const [firecrawlPing, setFirecrawlPing] = useState<FirecrawlPingResult | null>(null);
+  const [testingFirecrawl, setTestingFirecrawl] = useState(false);
 
   // Generic LLM Configuration
   const [llmBaseUrl, setLlmBaseUrl] = useState('');
@@ -78,7 +72,14 @@ export default function Settings() {
     fetch('/api/settings')
       .then(res => fetchJsonSafely(res))
       .then(data => {
-        if (data.firecrawlApiKey) setApiKey(data.firecrawlApiKey);
+        if (data.firecrawlApiKey) {
+          setApiKey(data.firecrawlApiKey);
+          // Auto-verify saved firecrawl key
+          handlePingFirecrawl(data.firecrawlApiKey);
+        } else {
+          handlePingFirecrawl('');
+        }
+
         if (data.supabaseUrl) setSupabaseUrl(data.supabaseUrl);
         if (data.supabaseKey) setSupabaseKey(data.supabaseKey);
         
@@ -103,24 +104,44 @@ export default function Settings() {
       })
       .catch(err => console.error('Failed to load settings:', err));
 
-    // 2. Automatically check Supabase connection status
-    checkSupabaseConnection();
+    // 2. Automatically check Supabase connection status on load
+    handlePingSupabase();
   }, []);
 
-  const checkSupabaseConnection = async () => {
+  const handlePingSupabase = async (urlToTest?: string, keyToTest?: string) => {
     setTestingSupabase(true);
     try {
-      const res = await fetch('/api/supabase/status');
-      const data = await fetchJsonSafely(res);
-      setSupabaseStatus(data);
+      const result = await verifySupabaseConnection(
+        urlToTest && keyToTest ? { url: urlToTest, key: keyToTest } : undefined
+      );
+      setSupabasePing(result);
     } catch (err: any) {
-      setSupabaseStatus({
-        configured: false,
+      setSupabasePing({
         connected: false,
-        error: err.message || 'Network error checking Supabase connection.'
+        latencyMs: 0,
+        status: 'disconnected',
+        error: err.message || 'Failed to ping Supabase database'
       });
     } finally {
       setTestingSupabase(false);
+    }
+  };
+
+  const handlePingFirecrawl = async (keyToTest?: string) => {
+    setTestingFirecrawl(true);
+    try {
+      const result = await verifyFirecrawlConnection(keyToTest !== undefined ? keyToTest : apiKey);
+      setFirecrawlPing(result);
+    } catch (err: any) {
+      setFirecrawlPing({
+        connected: false,
+        configured: !!keyToTest,
+        latencyMs: 0,
+        status: 'error',
+        error: err.message || 'Failed to ping Firecrawl API'
+      });
+    } finally {
+      setTestingFirecrawl(false);
     }
   };
 
@@ -132,7 +153,7 @@ export default function Settings() {
       const data = await fetchJsonSafely(res);
       if (data.success) {
         setSyncResult(`Synced ${data.syncedCount} project(s) to Supabase successfully!`);
-        checkSupabaseConnection();
+        handlePingSupabase();
       } else {
         setSyncResult(`Sync failed: ${data.error}`);
       }
@@ -202,8 +223,9 @@ export default function Settings() {
       });
       if (res.ok) {
         setMessage('Settings saved successfully.');
-        // Re-check Supabase with new credentials
-        checkSupabaseConnection();
+        // Re-verify connections with saved credentials
+        handlePingSupabase();
+        handlePingFirecrawl(apiKey);
       } else {
         setMessage('Failed to save settings.');
       }
@@ -215,18 +237,57 @@ export default function Settings() {
   };
 
   const handleCopySql = () => {
-    if (supabaseStatus?.schemaSql) {
-      navigator.clipboard.writeText(supabaseStatus.schemaSql);
-      setCopiedSql(true);
-      setTimeout(() => setCopiedSql(false), 2500);
-    }
+    const sqlToCopy = `-- RealIntel AI - Supabase Database Setup
+CREATE TABLE IF NOT EXISTS public.projects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    location TEXT,
+    official_url TEXT,
+    rera_registration_number TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.project_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
+    scraped_at TIMESTAMPTZ DEFAULT now(),
+    no_of_units INTEGER,
+    no_of_floors INTEGER,
+    land_area_acres NUMERIC,
+    base_price_per_sft NUMERIC,
+    landed_price_per_sft NUMERIC,
+    construction_stage TEXT,
+    handover_date TEXT,
+    schemes JSONB DEFAULT '[]'::jsonb,
+    social_ads_summary TEXT
+);
+
+CREATE TABLE IF NOT EXISTS public.weekly_deltas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
+    change_type TEXT,
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.project_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.weekly_deltas ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Public access to projects" ON public.projects FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Public access to project_snapshots" ON public.project_snapshots FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL USING (true) WITH CHECK (true);`;
+
+    navigator.clipboard.writeText(sqlToCopy);
+    setCopiedSql(true);
+    setTimeout(() => setCopiedSql(false), 2500);
   };
 
   return (
     <div className="p-8 max-w-4xl mx-auto space-y-8">
       <div>
         <h1 className="text-2xl font-bold text-zinc-900">Settings & Integrations</h1>
-        <p className="text-zinc-500">Configure external LLM providers (OpenRouter, OpenAI, Gemini), Supabase database, and crawler APIs.</p>
+        <p className="text-zinc-500">Configure external LLM providers, Supabase database, and Firecrawl web crawler.</p>
         <div className="mt-3 p-3 bg-blue-50 text-blue-800 text-xs rounded-lg border border-blue-200">
           <strong>Security Note:</strong> All API keys and connection parameters are encrypted and stored in local server SQLite storage (not exposed publicly).
         </div>
@@ -235,7 +296,7 @@ export default function Settings() {
       <form onSubmit={handleSave} className="space-y-6">
         
         {/* ========================================================================= */}
-        {/* 1. SUPABASE CONFIGURATION & CONNECTION CHECK */}
+        {/* 1. SUPABASE CONFIGURATION & CONNECTION STATUS */}
         {/* ========================================================================= */}
         <div className="bg-white p-6 rounded-2xl shadow-sm border border-zinc-200 space-y-5">
           <div className="flex items-center justify-between pb-4 border-b border-zinc-100">
@@ -244,43 +305,66 @@ export default function Settings() {
                 <Database className="w-5 h-5" />
               </div>
               <div>
-                <h2 className="text-lg font-semibold text-zinc-900">Database Storage (Supabase & Local SQLite)</h2>
+                <h2 className="text-lg font-semibold text-zinc-900">Supabase Database Connection</h2>
                 <p className="text-xs text-zinc-500">Storage for competitor projects, snapshots, and price history.</p>
               </div>
             </div>
             <button
               type="button"
-              onClick={checkSupabaseConnection}
+              onClick={() => handlePingSupabase(supabaseUrl, supabaseKey)}
               disabled={testingSupabase}
               className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 transition-colors disabled:opacity-50"
             >
               {testingSupabase ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-              {testingSupabase ? 'Testing...' : 'Check Supabase'}
+              {testingSupabase ? 'Pinging...' : 'Ping Database'}
             </button>
           </div>
 
-          {/* Built-in SQLite Notice */}
-          <div className="p-3 bg-zinc-50 border border-zinc-200 rounded-xl flex items-center justify-between text-xs text-zinc-700">
-            <div className="flex items-center gap-2">
-              <HardDrive className="w-4 h-4 text-zinc-600" />
-              <span>
-                <strong>Built-in SQLite Storage:</strong> Active ({supabaseStatus?.localProjectCount ?? 0} project(s) stored locally in <code>realintel.db</code>).
-              </span>
+          {/* Connection Status Indicator Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs">
+            <div className="flex items-center gap-2.5">
+              <span className="font-semibold text-zinc-700">Connection Status:</span>
+              {testingSupabase ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-600 bg-zinc-200/80 rounded-full">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Testing connection...
+                </span>
+              ) : supabasePing?.connected ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-emerald-800 bg-emerald-100 rounded-full border border-emerald-300">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  Connected {supabasePing.latencyMs ? `(${supabasePing.latencyMs}ms)` : ''}
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-amber-800 bg-amber-100 rounded-full border border-amber-300">
+                  <span className="w-2 h-2 rounded-full bg-amber-500" />
+                  Disconnected / Local SQLite Active
+                </span>
+              )}
             </div>
-            <span className="text-[11px] font-medium text-emerald-700 bg-emerald-100/70 px-2 py-0.5 rounded-full">
-              Always Ready
-            </span>
+
+            <div className="flex items-center gap-2 text-zinc-600">
+              {supabasePing?.connected && (
+                <span className="text-[11px] font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                  ✓ {supabasePing.projectCount ?? 0} project(s) ready
+                </span>
+              )}
+              {supabasePing?.url && (
+                <span className="text-[11px] text-zinc-500 font-mono hidden md:inline">
+                  {new URL(supabasePing.url.startsWith('http') ? supabasePing.url : `https://${supabasePing.url}`).hostname}
+                </span>
+              )}
+            </div>
           </div>
 
-          {/* Connection Status Banner */}
-          {supabaseStatus && (
+          {/* Detailed Connection Banner */}
+          {supabasePing && (
             <div className={`p-4 rounded-xl border text-sm transition-all ${
-              supabaseStatus.connected && supabaseStatus.tables?.projects
+              supabasePing.connected && supabasePing.status !== 'missing_tables'
                 ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
                 : 'bg-amber-50/70 border-amber-200 text-amber-900'
             }`}>
               <div className="flex items-start gap-3">
-                {supabaseStatus.connected && supabaseStatus.tables?.projects ? (
+                {supabasePing.connected && supabasePing.status !== 'missing_tables' ? (
                   <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
                 ) : (
                   <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
@@ -288,36 +372,36 @@ export default function Settings() {
                 <div className="flex-1 space-y-1.5">
                   <div className="flex items-center justify-between">
                     <p className="font-semibold text-sm">
-                      {supabaseStatus.connected && supabaseStatus.tables?.projects
+                      {supabasePing.connected && supabasePing.status !== 'missing_tables'
                         ? 'Supabase Cloud Database Connected'
-                        : supabaseStatus.connected
+                        : supabasePing.status === 'missing_tables'
                         ? 'Connected to Supabase (Tables Missing)'
-                        : 'Supabase Not Connected (Using Local SQLite Database)'}
+                        : 'Supabase Not Connected (Local SQLite Active)'}
                     </p>
-                    {supabaseStatus.source && supabaseStatus.source !== 'none' && (
+                    {supabasePing.source && (
                       <span className="text-[11px] px-2 py-0.5 rounded-full font-mono bg-white/70 border border-zinc-200 text-zinc-600">
-                        source: {supabaseStatus.source}
+                        source: {supabasePing.source}
                       </span>
                     )}
                   </div>
 
-                  {supabaseStatus.connected ? (
+                  {supabasePing.connected ? (
                     <div className="text-xs text-zinc-600 space-y-2">
                       <p>
-                        Target URL: <code className="bg-white/80 px-1 py-0.5 rounded border border-zinc-200 font-mono text-[11px]">{supabaseStatus.url || 'Configured'}</code>
+                        Target URL: <code className="bg-white/80 px-1 py-0.5 rounded border border-zinc-200 font-mono text-[11px]">{supabasePing.url || 'Configured'}</code>
                       </p>
                       <div className="flex flex-wrap items-center gap-2 pt-1">
-                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabaseStatus.tables?.projects ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
-                          projects: {supabaseStatus.tables?.projects ? `✓ (${supabaseStatus.projectCount ?? 0} saved)` : '✗ missing'}
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.projects ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
+                          projects: {supabasePing.tables?.projects ? `✓ (${supabasePing.projectCount ?? 0} saved)` : '✗ missing'}
                         </span>
-                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabaseStatus.tables?.project_snapshots ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
-                          snapshots: {supabaseStatus.tables?.project_snapshots ? '✓' : '✗ missing'}
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.project_snapshots ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
+                          snapshots: {supabasePing.tables?.project_snapshots ? '✓' : '✗ missing'}
                         </span>
-                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabaseStatus.tables?.weekly_deltas ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
-                          weekly_deltas: {supabaseStatus.tables?.weekly_deltas ? '✓' : '✗ missing'}
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.weekly_deltas ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
+                          weekly_deltas: {supabasePing.tables?.weekly_deltas ? '✓' : '✗ missing'}
                         </span>
 
-                        {supabaseStatus.tables?.projects && (
+                        {supabasePing.tables?.projects && (
                           <button
                             type="button"
                             onClick={handleSyncToSupabase}
@@ -325,7 +409,7 @@ export default function Settings() {
                             className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
                           >
                             {syncing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
-                            Sync Local Projects to Supabase
+                            Sync Local to Supabase
                           </button>
                         )}
                       </div>
@@ -337,15 +421,12 @@ export default function Settings() {
                     </div>
                   ) : (
                     <div className="text-xs text-amber-800 space-y-1">
-                      <p><strong>Status:</strong> {supabaseStatus.error || 'All projects are currently stored in local SQLite database. Configure Supabase below to sync to the cloud.'}</p>
-                      <p className="text-[11px] text-zinc-500">
-                        In Coolify: You can set <code>SUPABASE_URL</code> and <code>SUPABASE_KEY</code> in Coolify Environment Variables, or enter them in the form below.
-                      </p>
+                      <p><strong>Notice:</strong> {supabasePing.error || 'All competitor data is saved locally in SQLite. Enter Supabase credentials below to sync with the cloud.'}</p>
                     </div>
                   )}
 
                   {/* Schema helper trigger */}
-                  {(!supabaseStatus.tables?.projects || !supabaseStatus.connected) && (
+                  {(!supabasePing.tables?.projects || !supabasePing.connected) && (
                     <div className="pt-2">
                       <button
                         type="button"
@@ -363,7 +444,7 @@ export default function Settings() {
           )}
 
           {/* Database SQL Setup Schema Viewer */}
-          {(showSqlSchema || (!supabaseStatus?.tables?.projects && supabaseStatus?.connected)) && (
+          {(showSqlSchema || (!supabasePing?.tables?.projects && supabasePing?.connected)) && (
             <div className="p-4 bg-zinc-900 rounded-xl text-zinc-200 border border-zinc-800 space-y-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
@@ -383,7 +464,7 @@ export default function Settings() {
                 To create the required tables and public access policies, open your <strong>Supabase Dashboard &gt; SQL Editor &gt; New Query</strong>, paste the script below, and click <strong>Run</strong>:
               </p>
               <pre className="p-3 bg-zinc-950 rounded-lg text-[11px] font-mono text-emerald-300 max-h-52 overflow-y-auto leading-relaxed border border-zinc-800">
-                {supabaseStatus?.schemaSql || `-- Run this in Supabase SQL Editor:
+                {`-- Run this in Supabase SQL Editor:
 CREATE TABLE IF NOT EXISTS public.projects (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
@@ -439,7 +520,7 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
                 onChange={e => setSupabaseUrl(e.target.value)}
                 placeholder="https://xxxx.supabase.co"
               />
-              <p className="mt-1 text-[11px] text-zinc-500">Found in Supabase &gt; Project Settings &gt; API (Leave empty to use built-in SQLite)</p>
+              <p className="mt-1 text-[11px] text-zinc-500">Found in Supabase &gt; Project Settings &gt; API</p>
             </div>
             <div>
               <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
@@ -458,7 +539,91 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
         </div>
 
         {/* ========================================================================= */}
-        {/* 2. GENERIC LLM CONFIGURATION (OpenRouter, OpenAI, Groq, Gemini, etc.) */}
+        {/* 2. FIRECRAWL WEB SCRAPER & CONNECTION STATUS */}
+        {/* ========================================================================= */}
+        <div className="bg-white p-6 rounded-2xl shadow-sm border border-zinc-200 space-y-4">
+          <div className="flex items-center justify-between pb-3 border-b border-zinc-100">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-amber-100 text-amber-600 rounded-lg">
+                <Key className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-zinc-900">Firecrawl Web Scraper</h2>
+                <p className="text-xs text-zinc-500">Crawls competitor official builder microsites (with automatic fallback to Jina Reader & Direct HTML).</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => handlePingFirecrawl(apiKey)}
+              disabled={testingFirecrawl}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 transition-colors disabled:opacity-50"
+            >
+              {testingFirecrawl ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              {testingFirecrawl ? 'Pinging...' : 'Ping Firecrawl'}
+            </button>
+          </div>
+
+          {/* Firecrawl Connection Status Indicator Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-zinc-50 border border-zinc-200 rounded-xl text-xs">
+            <div className="flex items-center gap-2.5">
+              <span className="font-semibold text-zinc-700">Connection Status:</span>
+              {testingFirecrawl ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-600 bg-zinc-200/80 rounded-full">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Testing Firecrawl...
+                </span>
+              ) : firecrawlPing?.connected ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-emerald-800 bg-emerald-100 rounded-full border border-emerald-300">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  Connected {firecrawlPing.latencyMs ? `(${firecrawlPing.latencyMs}ms)` : ''}
+                </span>
+              ) : firecrawlPing?.status === 'invalid_key' ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-red-800 bg-red-100 rounded-full border border-red-300">
+                  <span className="w-2 h-2 rounded-full bg-red-500" />
+                  Invalid API Key (401 Unauthorized)
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-700 bg-zinc-200/80 rounded-full border border-zinc-300">
+                  <span className="w-2 h-2 rounded-full bg-zinc-400" />
+                  Not Configured (Free Fallback Scrapers Active)
+                </span>
+              )}
+            </div>
+
+            <span className="text-[11px] text-zinc-500">
+              {firecrawlPing?.connected 
+                ? 'Primary cloud crawler active' 
+                : 'Using Jina Reader & Direct HTML fetch'}
+            </span>
+          </div>
+
+          {/* Firecrawl feedback notification */}
+          {firecrawlPing?.error && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <span>{firecrawlPing.error}</span>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
+              Firecrawl API Key (Optional)
+            </label>
+            <input 
+              type="password" 
+              className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none font-mono text-xs"
+              value={apiKey}
+              onChange={e => setApiKey(e.target.value)}
+              placeholder="fc-..."
+            />
+            <p className="mt-1 text-[11px] text-zinc-500">
+              Get an API key from <a href="https://firecrawl.dev" target="_blank" rel="noreferrer" className="text-emerald-600 hover:underline">firecrawl.dev</a>. If empty or blocked, fallback scrapers (Jina Reader & direct HTML) work automatically without any key.
+            </p>
+          </div>
+        </div>
+
+        {/* ========================================================================= */}
+        {/* 3. GENERIC LLM CONFIGURATION (OpenRouter, OpenAI, Groq, Gemini, etc.) */}
         {/* ========================================================================= */}
         <div className="bg-white p-6 rounded-2xl shadow-sm border border-zinc-200 space-y-5">
           <div className="flex items-center justify-between pb-4 border-b border-zinc-100">
@@ -621,37 +786,6 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
             />
             <p className="mt-1 text-[11px] text-zinc-500">
               Optional: Used for Google Search Grounding to verify RERA registry filings and property portal data if the competitor website blocks crawlers.
-            </p>
-          </div>
-        </div>
-
-        {/* ========================================================================= */}
-        {/* 3. FIRECRAWL SCRAPER */}
-        {/* ========================================================================= */}
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-zinc-200 space-y-4">
-          <div className="flex items-center gap-3 pb-3 border-b border-zinc-100">
-            <div className="p-2 bg-amber-100 text-amber-600 rounded-lg">
-              <Key className="w-5 h-5" />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold text-zinc-900">Firecrawl Web Scraper</h2>
-              <p className="text-xs text-zinc-500">Crawls competitor official builder microsites (with automatic fallback to Jina Reader & Direct HTML).</p>
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-              Firecrawl API Key
-            </label>
-            <input 
-              type="password" 
-              className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none font-mono text-xs"
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              placeholder="fc-..."
-            />
-            <p className="mt-1 text-[11px] text-zinc-500">
-              Get an API key from <a href="https://firecrawl.dev" target="_blank" rel="noreferrer" className="text-emerald-600 hover:underline">firecrawl.dev</a>. If empty or blocked, fallback scrapers are used automatically.
             </p>
           </div>
         </div>
