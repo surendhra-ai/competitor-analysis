@@ -1,4 +1,5 @@
 import express from 'express';
+import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import Database from 'better-sqlite3';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -81,7 +82,8 @@ async function scrapeUrlWithFallback(url: string, firecrawlApiKey: string): Prom
         body: JSON.stringify({
           url: url,
           formats: ['markdown']
-        })
+        }),
+        signal: AbortSignal.timeout(10000)
       });
 
       if (response.ok) {
@@ -106,7 +108,8 @@ async function scrapeUrlWithFallback(url: string, firecrawlApiKey: string): Prom
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/plain'
-      }
+      },
+      signal: AbortSignal.timeout(10000)
     });
     if (jinaRes.ok) {
       const text = await jinaRes.text();
@@ -126,7 +129,8 @@ async function scrapeUrlWithFallback(url: string, firecrawlApiKey: string): Prom
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      }
+      },
+      signal: AbortSignal.timeout(10000)
     });
     if (directRes.ok) {
       const html = await directRes.text();
@@ -421,7 +425,7 @@ async function callLLM(promptText: string, schema: any, customConfig?: { baseUrl
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || '3000', 10);
 
   app.use(express.json());
 
@@ -1410,7 +1414,7 @@ async function startServer() {
     }
   });
 
-  // Vite middleware for development
+  // Vite middleware for development vs Express static for production
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1418,7 +1422,13 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static('dist'));
+    app.use(express.static(path.resolve(process.cwd(), 'dist')));
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/api/')) {
+        return res.status(404).json({ error: `API route ${req.method} ${req.path} not found.` });
+      }
+      res.sendFile(path.resolve(process.cwd(), 'dist', 'index.html'));
+    });
   }
 
   app.listen(PORT, '0.0.0.0', () => {

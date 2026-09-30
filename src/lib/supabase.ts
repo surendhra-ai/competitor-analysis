@@ -45,7 +45,9 @@ export function getSupabaseClient(url?: string, key?: string): SupabaseClient | 
     return cachedClient;
   }
 
-  cachedClient = createClient(targetUrl, targetKey);
+  cachedClient = createClient(targetUrl, targetKey, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+  });
   cachedUrl = targetUrl;
   cachedKey = targetKey;
   return cachedClient;
@@ -70,7 +72,9 @@ export async function verifySupabaseConnection(options?: {
 
       // Attempt lightweight ping via postgrest head request if valid format
       try {
-        const client = createClient(trimmedUrl, trimmedKey);
+        const client = getSupabaseClient(trimmedUrl, trimmedKey) || createClient(trimmedUrl, trimmedKey, {
+          auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+        });
         // Lightweight ping: head: true only fetches headers and exact count, no rows payload
         const { error, count } = await client
           .from('projects')
