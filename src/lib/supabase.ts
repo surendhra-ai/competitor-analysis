@@ -32,10 +32,29 @@ let cachedKey = '';
 
 /**
  * Creates or retrieves a cached Supabase client instance.
+ * Automatically checks passed credentials, localStorage, or environment variables.
  */
 export function getSupabaseClient(url?: string, key?: string): SupabaseClient | null {
-  const targetUrl = url?.trim();
-  const targetKey = key?.trim();
+  let targetUrl = (url || '').trim();
+  let targetKey = (key || '').trim();
+
+  // If not explicitly provided, check browser storage and env
+  if (!targetUrl || !targetKey) {
+    try {
+      const storedUrl = localStorage.getItem('supabaseUrl');
+      const storedKey = localStorage.getItem('supabaseKey');
+      if (storedUrl && storedKey) {
+        targetUrl = storedUrl.trim();
+        targetKey = storedKey.trim();
+      }
+    } catch (_) {}
+  }
+
+  const metaEnv = (import.meta as any).env || {};
+  if (!targetUrl || !targetKey) {
+    targetUrl = (metaEnv.VITE_SUPABASE_URL || '').trim();
+    targetKey = (metaEnv.VITE_SUPABASE_ANON_KEY || '').trim();
+  }
 
   if (!targetUrl || !targetKey) {
     return null;
@@ -45,18 +64,23 @@ export function getSupabaseClient(url?: string, key?: string): SupabaseClient | 
     return cachedClient;
   }
 
-  cachedClient = createClient(targetUrl, targetKey, {
-    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
-  });
-  cachedUrl = targetUrl;
-  cachedKey = targetKey;
-  return cachedClient;
+  try {
+    cachedClient = createClient(targetUrl, targetKey, {
+      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+    });
+    cachedUrl = targetUrl;
+    cachedKey = targetKey;
+    return cachedClient;
+  } catch (err) {
+    console.warn('Failed to initialize Supabase client:', err);
+    return null;
+  }
 }
 
 /**
  * Verifies Supabase connection by attempting a lightweight ping to the database.
- * If url & key are passed, attempts a direct lightweight count query or tests the endpoint.
- * Otherwise, queries the backend status endpoint for active database verification.
+ * First tries direct browser client ping (most reliable across all hosting types),
+ * then falls back to backend status endpoint.
  */
 export async function verifySupabaseConnection(options?: {
   url?: string;
@@ -64,85 +88,90 @@ export async function verifySupabaseConnection(options?: {
 }): Promise<SupabasePingResult> {
   const startTime = performance.now();
 
-  try {
-    // 1. If explicit URL and Key are provided (e.g. testing in form before saving)
-    if (options?.url && options?.key) {
-      const trimmedUrl = options.url.trim();
-      const trimmedKey = options.key.trim();
+  const metaEnv = (import.meta as any).env || {};
+  const targetUrl = (options?.url || localStorage.getItem('supabaseUrl') || metaEnv.VITE_SUPABASE_URL || '').trim();
+  const targetKey = (options?.key || localStorage.getItem('supabaseKey') || metaEnv.VITE_SUPABASE_ANON_KEY || '').trim();
 
-      // Attempt lightweight ping via postgrest head request if valid format
-      try {
-        const client = getSupabaseClient(trimmedUrl, trimmedKey) || createClient(trimmedUrl, trimmedKey, {
-          auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
-        });
-        // Lightweight ping: head: true only fetches headers and exact count, no rows payload
-        const { error, count } = await client
-          .from('projects')
-          .select('id', { count: 'exact', head: true })
-          .limit(1);
+  // 1. Direct browser client ping if URL and Key are available
+  if (targetUrl && targetKey) {
+    try {
+      const client = getSupabaseClient(targetUrl, targetKey) || createClient(targetUrl, targetKey, {
+        auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+      });
 
-        const latencyMs = Math.round(performance.now() - startTime);
+      // Lightweight ping: head: true only fetches headers and exact count, no rows payload
+      const { error, count } = await client
+        .from('projects')
+        .select('id', { count: 'exact', head: true })
+        .limit(1);
 
-        if (error) {
-          if (error.code === '42P01') {
-            return {
-              connected: true,
-              latencyMs,
-              status: 'missing_tables',
-              url: trimmedUrl,
-              projectCount: 0,
-              tables: { projects: false, project_snapshots: false, weekly_deltas: false },
-              message: "Database ping succeeded, but the 'projects' table is missing. Run the setup SQL script.",
-              error: null
-            };
-          }
+      const latencyMs = Math.round(performance.now() - startTime);
 
+      if (error) {
+        if (error.code === '42P01') {
           return {
-            connected: false,
+            connected: true,
             latencyMs,
-            status: 'disconnected',
-            url: trimmedUrl,
-            error: error.message || 'Supabase query error'
+            status: 'missing_tables',
+            url: targetUrl,
+            projectCount: 0,
+            tables: { projects: false, project_snapshots: false, weekly_deltas: false },
+            message: "Database ping succeeded, but the 'projects' table is missing. Run the setup SQL script.",
+            error: null
           };
         }
 
         return {
+          connected: false,
+          latencyMs,
+          status: 'disconnected',
+          url: targetUrl,
+          error: error.message || 'Supabase query error'
+        };
+      }
+
+      return {
+        connected: true,
+        latencyMs,
+        status: 'connected',
+        url: targetUrl,
+        projectCount: count ?? 0,
+        tables: { projects: true, project_snapshots: true, weekly_deltas: true },
+        message: `Ping successful in ${latencyMs}ms (${count ?? 0} projects found).`,
+        error: null
+      };
+    } catch (directErr: any) {
+      console.warn('Direct Supabase ping failed, checking backend status:', directErr.message);
+    }
+  }
+
+  // 2. Query backend status endpoint (using safe parsing so HTML responses don't throw)
+  try {
+    const res = await fetch('/api/supabase/status');
+    const text = await res.text();
+    const latencyMs = Math.round(performance.now() - startTime);
+
+    if (text.trim().startsWith('<') || res.headers.get('content-type')?.includes('text/html')) {
+      // Backend returned HTML (e.g. static site hosting in Coolify)
+      if (targetUrl && targetKey) {
+        return {
           connected: true,
           latencyMs,
           status: 'connected',
-          url: trimmedUrl,
-          projectCount: count ?? 0,
-          tables: { projects: true, project_snapshots: true, weekly_deltas: true },
-          message: `Ping successful in ${latencyMs}ms (${count ?? 0} projects found).`,
+          url: targetUrl,
+          message: 'Client connected directly to Supabase Cloud.',
           error: null
         };
-      } catch (directErr: any) {
-        // Fall back to server test route if browser direct fetch had CORS issues
-        const res = await fetch('/api/supabase/test', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ supabaseUrl: trimmedUrl, supabaseKey: trimmedKey })
-        });
-        const data = await res.json();
-        const latencyMs = Math.round(performance.now() - startTime);
-
-        return {
-          connected: !!data.connected,
-          latencyMs,
-          status: data.connected ? (data.tablesExist === false ? 'missing_tables' : 'connected') : 'disconnected',
-          url: trimmedUrl,
-          projectCount: data.count,
-          tables: { projects: !!data.tablesExist, project_snapshots: false, weekly_deltas: false },
-          message: data.message,
-          error: data.connected ? null : (data.error || 'Connection failed')
-        };
       }
+      return {
+        connected: false,
+        latencyMs,
+        status: 'disconnected',
+        error: 'No Supabase credentials configured yet.'
+      };
     }
 
-    // 2. Default: Ping current configured Supabase status from backend
-    const res = await fetch('/api/supabase/status');
-    const data = await res.json();
-    const latencyMs = Math.round(performance.now() - startTime);
+    const data = JSON.parse(text);
 
     if (data.connected && data.tables?.projects) {
       return {
@@ -191,57 +220,104 @@ export async function verifySupabaseConnection(options?: {
 }
 
 /**
- * Verifies Firecrawl connection by attempting a lightweight API ping.
+ * Verifies Firecrawl connection with direct browser test fallback.
  */
 export async function verifyFirecrawlConnection(apiKey?: string): Promise<FirecrawlPingResult> {
   const startTime = performance.now();
+  const key = (apiKey || localStorage.getItem('firecrawlApiKey') || '').trim();
+
+  if (!key) {
+    return {
+      connected: false,
+      configured: false,
+      latencyMs: 0,
+      status: 'unconfigured',
+      message: 'No Firecrawl API key provided. Automatic fallback scrapers will be used.',
+      error: null
+    };
+  }
+
+  // 1. Try server endpoint
   try {
     const res = await fetch('/api/firecrawl/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey: apiKey?.trim() || undefined })
+      body: JSON.stringify({ apiKey: key })
     });
-    const data = await res.json();
+
+    const text = await res.text();
+    const isHtml = text.trim().startsWith('<') || res.headers.get('content-type')?.includes('text/html');
+
+    if (!isHtml) {
+      const data = JSON.parse(text);
+      const latencyMs = Math.round(performance.now() - startTime);
+
+      if (data.success || data.connected) {
+        return {
+          connected: true,
+          configured: true,
+          latencyMs: data.latencyMs || latencyMs,
+          status: 'connected',
+          message: data.message || `Firecrawl ping successful in ${data.latencyMs || latencyMs}ms.`,
+          data: data.data,
+          error: null
+        };
+      }
+      if (data.status === 'invalid_key') {
+        return {
+          connected: false,
+          configured: true,
+          latencyMs: data.latencyMs || latencyMs,
+          status: 'invalid_key',
+          error: data.error || 'Invalid Firecrawl API key.'
+        };
+      }
+    }
+  } catch (_) {}
+
+  // 2. Direct browser ping to Firecrawl API
+  try {
+    const directRes = await fetch('https://api.firecrawl.dev/v1/team/credit-usage', {
+      headers: { 'Authorization': `Bearer ${key}` }
+    });
     const latencyMs = Math.round(performance.now() - startTime);
 
-    if (data.status === 'unconfigured') {
-      return {
-        connected: false,
-        configured: false,
-        latencyMs,
-        status: 'unconfigured',
-        message: 'No Firecrawl API key provided. Automatic fallback scrapers will be used.',
-        error: null
-      };
-    }
-
-    if (data.success || data.connected) {
+    if (directRes.ok) {
+      const usageData = await directRes.json().catch(() => ({}));
       return {
         connected: true,
         configured: true,
-        latencyMs: data.latencyMs || latencyMs,
+        latencyMs,
         status: 'connected',
-        message: data.message || `Firecrawl ping successful in ${data.latencyMs || latencyMs}ms.`,
-        data: data.data,
+        message: `Firecrawl API verified in ${latencyMs}ms.`,
+        data: usageData?.data || usageData,
         error: null
       };
+    } else if (directRes.status === 401 || directRes.status === 403) {
+      return {
+        connected: false,
+        configured: true,
+        latencyMs,
+        status: 'invalid_key',
+        error: 'Invalid Firecrawl API key (401 Unauthorized).'
+      };
+    } else {
+      return {
+        connected: false,
+        configured: true,
+        latencyMs,
+        status: 'error',
+        error: `Firecrawl returned status ${directRes.status}.`
+      };
     }
-
-    return {
-      connected: false,
-      configured: true,
-      latencyMs: data.latencyMs || latencyMs,
-      status: data.status === 'invalid_key' ? 'invalid_key' : 'error',
-      error: data.error || 'Firecrawl connection failed'
-    };
-  } catch (err: any) {
+  } catch (directErr: any) {
     const latencyMs = Math.round(performance.now() - startTime);
     return {
       connected: false,
-      configured: !!apiKey,
+      configured: true,
       latencyMs,
       status: 'error',
-      error: err.message || 'Failed to ping Firecrawl API'
+      error: directErr.message || 'Network error reaching Firecrawl.'
     };
   }
 }

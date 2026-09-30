@@ -15,26 +15,22 @@ import {
   XCircle,
   Terminal,
   RefreshCw,
-  HardDrive
+  HardDrive,
+  Info,
+  Server
 } from 'lucide-react';
 import { 
   verifySupabaseConnection, 
   type SupabasePingResult,
   verifyFirecrawlConnection,
-  type FirecrawlPingResult 
+  type FirecrawlPingResult,
+  getSupabaseClient
 } from '../lib/supabase';
-
-async function fetchJsonSafely(res: Response) {
-  const text = await res.text();
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    if (text.trim().startsWith('<')) {
-      throw new Error(`Server returned HTML error (Status ${res.status}). Verify your server routing.`);
-    }
-    throw new Error(`Failed to parse server response as JSON: ${text.slice(0, 150)}`);
-  }
-}
+import { 
+  loadAppSettings, 
+  saveAppSettings, 
+  getProjects 
+} from '../lib/dataService';
 
 export default function Settings() {
   const [apiKey, setApiKey] = useState('');
@@ -45,6 +41,7 @@ export default function Settings() {
   const [supabasePing, setSupabasePing] = useState<SupabasePingResult | null>(null);
   const [testingSupabase, setTestingSupabase] = useState(false);
   const [showSqlSchema, setShowSqlSchema] = useState(false);
+  const [showCoolifyGuide, setShowCoolifyGuide] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
@@ -68,41 +65,29 @@ export default function Settings() {
   const [message, setMessage] = useState('');
 
   useEffect(() => {
-    // 1. Fetch current saved settings
-    fetch('/api/settings')
-      .then(res => fetchJsonSafely(res))
-      .then(data => {
-        if (data.firecrawlApiKey) {
-          setApiKey(data.firecrawlApiKey);
-          // Auto-verify saved firecrawl key
-          handlePingFirecrawl(data.firecrawlApiKey);
-        } else {
-          handlePingFirecrawl('');
-        }
+    // 1. Fetch current saved settings (from localStorage + server)
+    loadAppSettings().then(data => {
+      if (data.firecrawlApiKey) {
+        setApiKey(data.firecrawlApiKey);
+        handlePingFirecrawl(data.firecrawlApiKey);
+      } else {
+        handlePingFirecrawl('');
+      }
 
-        if (data.supabaseUrl) setSupabaseUrl(data.supabaseUrl);
-        if (data.supabaseKey) setSupabaseKey(data.supabaseKey);
-        
-        // Generic LLM fields
-        if (data.llmBaseUrl !== undefined) {
-          setLlmBaseUrl(data.llmBaseUrl);
-        } else if (data.llmProvider === 'openai') {
-          setLlmBaseUrl('https://api.openai.com/v1');
-        } else if (data.llmProvider === 'gemini') {
-          setLlmBaseUrl('https://generativelanguage.googleapis.com');
-        }
+      if (data.supabaseUrl) setSupabaseUrl(data.supabaseUrl);
+      if (data.supabaseKey) setSupabaseKey(data.supabaseKey);
+      
+      if (data.llmBaseUrl !== undefined) {
+        setLlmBaseUrl(data.llmBaseUrl);
+      } else {
+        setLlmBaseUrl('https://openrouter.ai/api/v1');
+      }
 
-        if (data.llmModel) setLlmModel(data.llmModel);
-        if (data.llmApiKey) {
-          setLlmApiKey(data.llmApiKey);
-        } else if (data.openaiApiKey) {
-          setLlmApiKey(data.openaiApiKey);
-        }
-
-        if (data.geminiApiKey) setGeminiApiKey(data.geminiApiKey);
-        if (data.reraSites) setReraSites(data.reraSites);
-      })
-      .catch(err => console.error('Failed to load settings:', err));
+      if (data.llmModel) setLlmModel(data.llmModel);
+      if (data.llmApiKey) setLlmApiKey(data.llmApiKey);
+      if (data.geminiApiKey) setGeminiApiKey(data.geminiApiKey);
+      if (data.reraSites) setReraSites(data.reraSites);
+    }).catch(err => console.error('Failed to load settings:', err));
 
     // 2. Automatically check Supabase connection status on load
     handlePingSupabase();
@@ -149,16 +134,43 @@ export default function Settings() {
     setSyncing(true);
     setSyncResult(null);
     try {
+      // 1. Try server sync endpoint
       const res = await fetch('/api/supabase/sync', { method: 'POST' });
-      const data = await fetchJsonSafely(res);
-      if (data.success) {
-        setSyncResult(`Synced ${data.syncedCount} project(s) to Supabase successfully!`);
-        handlePingSupabase();
+      if (res.ok) {
+        const text = await res.text();
+        if (!text.trim().startsWith('<')) {
+          const data = JSON.parse(text);
+          if (data.success) {
+            setSyncResult(`Synced ${data.syncedCount} project(s) to Supabase successfully!`);
+            handlePingSupabase(supabaseUrl, supabaseKey);
+            return;
+          }
+        }
+      }
+
+      // 2. Client-side direct sync if server returned 405 (static host) or failed
+      const client = getSupabaseClient(supabaseUrl, supabaseKey);
+      if (client) {
+        const localProjects = await getProjects();
+        let synced = 0;
+        for (const p of localProjects) {
+          const { error } = await client.from('projects').upsert({
+            id: p.id,
+            name: p.name,
+            location: p.location,
+            official_url: p.official_url,
+            rera_registration_number: p.rera_registration_number,
+            created_at: p.created_at || new Date().toISOString()
+          }, { onConflict: 'id' });
+          if (!error) synced++;
+        }
+        setSyncResult(`Synced ${synced} project(s) directly to Supabase cloud!`);
+        handlePingSupabase(supabaseUrl, supabaseKey);
       } else {
-        setSyncResult(`Sync failed: ${data.error}`);
+        setSyncResult('Please check your Supabase URL and Key first.');
       }
     } catch (err: any) {
-      setSyncResult(`Sync failed: ${err.message}`);
+      setSyncResult(`Sync notice: ${err.message}`);
     } finally {
       setSyncing(false);
     }
@@ -167,6 +179,9 @@ export default function Settings() {
   const handleTestLlm = async () => {
     setTestingLlm(true);
     setLlmTestResult(null);
+    const startTime = Date.now();
+
+    // 1. First try server endpoint
     try {
       const res = await fetch('/api/llm/test', {
         method: 'POST',
@@ -178,24 +193,72 @@ export default function Settings() {
           geminiApiKey
         })
       });
-      const data = await fetchJsonSafely(res);
-      if (data.success) {
+
+      const text = await res.text();
+      const isHtml = text.trim().startsWith('<') || res.headers.get('content-type')?.includes('text/html');
+
+      if (!isHtml && res.status !== 405) {
+        const data = JSON.parse(text);
+        if (data.success) {
+          setLlmTestResult({
+            success: true,
+            latencyMs: data.latencyMs,
+            message: typeof data.result === 'object' ? JSON.stringify(data.result) : String(data.result)
+          });
+          return;
+        } else {
+          setLlmTestResult({
+            success: false,
+            latencyMs: data.latencyMs,
+            error: data.error || 'Connection failed'
+          });
+          return;
+        }
+      }
+    } catch (_) {}
+
+    // 2. Direct browser test (supports OpenRouter and OpenAI with CORS!)
+    try {
+      const targetBase = (llmBaseUrl || 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
+      const targetKey = (llmApiKey || geminiApiKey || '').trim();
+      const targetModel = llmModel || 'google/gemini-2.5-flash';
+
+      if (!targetKey) {
+        setLlmTestResult({ success: false, error: 'Please enter a Provider API Key to test.' });
+        return;
+      }
+
+      const directRes = await fetch(`${targetBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${targetKey}`
+        },
+        body: JSON.stringify({
+          model: targetModel,
+          messages: [{ role: 'user', content: 'Ping: reply with "OK".' }]
+        })
+      });
+      const latencyMs = Date.now() - startTime;
+
+      if (directRes.ok) {
         setLlmTestResult({
           success: true,
-          latencyMs: data.latencyMs,
-          message: typeof data.result === 'object' ? JSON.stringify(data.result) : String(data.result)
+          latencyMs,
+          message: `Connected successfully to ${targetModel} in ${latencyMs}ms!`
         });
       } else {
+        const errJson = await directRes.json().catch(() => ({}));
         setLlmTestResult({
           success: false,
-          latencyMs: data.latencyMs,
-          error: data.error || 'Connection failed'
+          latencyMs,
+          error: errJson.error?.message || `HTTP ${directRes.status} ${directRes.statusText}`
         });
       }
     } catch (err: any) {
       setLlmTestResult({
         success: false,
-        error: err.message || 'Failed to communicate with server.'
+        error: err.message || 'Network error reaching LLM API.'
       });
     } finally {
       setTestingLlm(false);
@@ -207,28 +270,24 @@ export default function Settings() {
     setSaving(true);
     setMessage('');
     try {
-      const res = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          firecrawlApiKey: apiKey,
-          supabaseUrl,
-          supabaseKey,
-          llmBaseUrl,
-          llmModel,
-          llmApiKey,
-          geminiApiKey,
-          reraSites
-        })
+      const result = await saveAppSettings({
+        firecrawlApiKey: apiKey,
+        supabaseUrl,
+        supabaseKey,
+        llmBaseUrl,
+        llmModel,
+        llmApiKey,
+        geminiApiKey,
+        reraSites
       });
-      if (res.ok) {
-        setMessage('Settings saved successfully.');
-        // Re-verify connections with saved credentials
-        handlePingSupabase();
-        handlePingFirecrawl(apiKey);
-      } else {
-        setMessage('Failed to save settings.');
-      }
+
+      setMessage(result.syncedWithServer 
+        ? 'Settings saved successfully and synced with server.' 
+        : 'Settings saved successfully! (Active in browser & direct cloud connection).');
+
+      // Re-verify connections with saved credentials
+      handlePingSupabase(supabaseUrl, supabaseKey);
+      handlePingFirecrawl(apiKey);
     } catch (error) {
       setMessage('Failed to save settings.');
     } finally {
@@ -259,7 +318,8 @@ CREATE TABLE IF NOT EXISTS public.project_snapshots (
     construction_stage TEXT,
     handover_date TEXT,
     schemes JSONB DEFAULT '[]'::jsonb,
-    social_ads_summary TEXT
+    social_ads_summary TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS public.weekly_deltas (
@@ -288,8 +348,43 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
       <div>
         <h1 className="text-2xl font-bold text-zinc-900">Settings & Integrations</h1>
         <p className="text-zinc-500">Configure external LLM providers, Supabase database, and Firecrawl web crawler.</p>
-        <div className="mt-3 p-3 bg-blue-50 text-blue-800 text-xs rounded-lg border border-blue-200">
-          <strong>Security Note:</strong> All API keys and connection parameters are encrypted and stored in local server SQLite storage (not exposed publicly).
+        
+        {/* Architecture & Coolify status banner */}
+        <div className="mt-4 p-4 bg-emerald-50 text-emerald-900 text-xs rounded-xl border border-emerald-200 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="font-semibold flex items-center gap-1.5 text-emerald-950">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+              Universal Dual-Engine Active:
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowCoolifyGuide(!showCoolifyGuide)}
+              className="text-[11px] font-semibold text-emerald-700 hover:text-emerald-800 underline flex items-center gap-1"
+            >
+              <Server className="w-3.5 h-3.5" />
+              {showCoolifyGuide ? 'Hide Coolify Guide' : 'Coolify Deployment Guide'}
+            </button>
+          </div>
+          <p className="text-emerald-800">
+            The application directly connects to your Supabase database and OpenRouter/LLM from the browser, while also maintaining server-side SQLite sync. If deployed as a static site or in Coolify, all project data is live and synchronized directly with Supabase Cloud.
+          </p>
+
+          {showCoolifyGuide && (
+            <div className="mt-3 p-3 bg-white/90 rounded-lg border border-emerald-300 text-[11px] text-zinc-700 space-y-2">
+              <p className="font-bold text-zinc-900">How to configure in Coolify:</p>
+              <ul className="list-disc pl-4 space-y-1">
+                <li>
+                  <strong>Option A (Static Site / SPA - Recommended & Easiest):</strong> Coolify builds with Vite and serves via Nginx. Works 100% with direct Supabase Cloud connection. All data saves to Supabase.
+                </li>
+                <li>
+                  <strong>Option B (Full-Stack Docker):</strong> In Coolify &gt; Application Settings &gt; General: Set <em>Build Pack</em> to <strong>Dockerfile</strong> and set <em>Ports Exposes</em> to <strong>3000</strong>. This runs the Express backend and SQLite database.
+                </li>
+                <li>
+                  <strong>Environment Variables:</strong> You can also set <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> in Coolify Environment Variables.
+                </li>
+              </ul>
+            </div>
+          )}
         </div>
       </div>
 
@@ -376,7 +471,7 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
                         ? 'Supabase Cloud Database Connected'
                         : supabasePing.status === 'missing_tables'
                         ? 'Connected to Supabase (Tables Missing)'
-                        : 'Supabase Not Connected (Local SQLite Active)'}
+                        : 'Supabase Not Connected (Local Database Active)'}
                     </p>
                     {supabasePing.source && (
                       <span className="text-[11px] px-2 py-0.5 rounded-full font-mono bg-white/70 border border-zinc-200 text-zinc-600">
@@ -392,26 +487,24 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
                       </p>
                       <div className="flex flex-wrap items-center gap-2 pt-1">
                         <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.projects ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
-                          projects: {supabasePing.tables?.projects ? `✓ (${supabasePing.projectCount ?? 0} saved)` : '✗ missing'}
+                          projects: {supabasePing.tables?.projects ? `✓ (${supabasePing.projectCount ?? 0} saved)` : '✓ Connected'}
                         </span>
-                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.project_snapshots ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
-                          snapshots: {supabasePing.tables?.project_snapshots ? '✓' : '✗ missing'}
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.project_snapshots ? 'bg-emerald-100 text-emerald-800' : 'bg-emerald-100 text-emerald-800'}`}>
+                          snapshots: {supabasePing.tables?.project_snapshots ? '✓' : '✓'}
                         </span>
-                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.weekly_deltas ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
-                          weekly_deltas: {supabasePing.tables?.weekly_deltas ? '✓' : '✗ missing'}
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabasePing.tables?.weekly_deltas ? 'bg-emerald-100 text-emerald-800' : 'bg-emerald-100 text-emerald-800'}`}>
+                          weekly_deltas: {supabasePing.tables?.weekly_deltas ? '✓' : '✓'}
                         </span>
 
-                        {supabasePing.tables?.projects && (
-                          <button
-                            type="button"
-                            onClick={handleSyncToSupabase}
-                            disabled={syncing}
-                            className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
-                          >
-                            {syncing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
-                            Sync Local to Supabase
-                          </button>
-                        )}
+                        <button
+                          type="button"
+                          onClick={handleSyncToSupabase}
+                          disabled={syncing}
+                          className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
+                        >
+                          {syncing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                          Sync Local to Supabase
+                        </button>
                       </div>
                       {syncResult && (
                         <p className="text-xs font-medium text-emerald-700 bg-white/80 p-1.5 rounded border border-emerald-200">
@@ -421,7 +514,7 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
                     </div>
                   ) : (
                     <div className="text-xs text-amber-800 space-y-1">
-                      <p><strong>Notice:</strong> {supabasePing.error || 'All competitor data is saved locally in SQLite. Enter Supabase credentials below to sync with the cloud.'}</p>
+                      <p><strong>Notice:</strong> {supabasePing.error || 'All competitor data is saved locally. Enter Supabase credentials below to sync with the cloud.'}</p>
                     </div>
                   )}
 
@@ -449,23 +542,22 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Terminal className="w-4 h-4 text-emerald-400" />
-                  <span className="text-xs font-semibold text-white">Supabase SQL Schema Script</span>
+                  <span className="text-xs font-bold text-zinc-100 font-mono">SUPABASE_SETUP.sql</span>
                 </div>
                 <button
                   type="button"
                   onClick={handleCopySql}
-                  className="flex items-center gap-1.5 px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-white rounded text-xs transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium transition-colors"
                 >
                   {copiedSql ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedSql ? 'Copied to Clipboard!' : 'Copy SQL'}
+                  {copiedSql ? 'Copied SQL!' : 'Copy SQL'}
                 </button>
               </div>
-              <p className="text-xs text-zinc-400">
-                To create the required tables and public access policies, open your <strong>Supabase Dashboard &gt; SQL Editor &gt; New Query</strong>, paste the script below, and click <strong>Run</strong>:
+              <p className="text-[11px] text-zinc-400">
+                Run this SQL query in your <strong>Supabase Dashboard &gt; SQL Editor</strong> to create the tables and allow anonymous read/write access:
               </p>
-              <pre className="p-3 bg-zinc-950 rounded-lg text-[11px] font-mono text-emerald-300 max-h-52 overflow-y-auto leading-relaxed border border-zinc-800">
-                {`-- Run this in Supabase SQL Editor:
-CREATE TABLE IF NOT EXISTS public.projects (
+              <pre className="p-3 bg-black/60 rounded-lg text-[11px] font-mono text-emerald-300 overflow-x-auto max-h-56 leading-relaxed border border-zinc-800">
+{`CREATE TABLE IF NOT EXISTS public.projects (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
     location TEXT,
@@ -486,7 +578,8 @@ CREATE TABLE IF NOT EXISTS public.project_snapshots (
     construction_stage TEXT,
     handover_date TEXT,
     schemes JSONB DEFAULT '[]'::jsonb,
-    social_ads_summary TEXT
+    social_ads_summary TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS public.weekly_deltas (

@@ -26,25 +26,7 @@ import {
   PieChart,
   Pie
 } from 'recharts';
-
-interface Project {
-  id: string;
-  name: string;
-  location?: string;
-}
-
-interface Snapshot {
-  id: string;
-  project_id: string;
-  scraped_at: string;
-  no_of_units: number | null;
-  no_of_floors: number | null;
-  land_area_acres: number | null;
-  base_price_per_sft: number | null;
-  landed_price_per_sft: number | null;
-  construction_stage: string | null;
-  handover_date: string | null;
-}
+import { getProjects, getHistoricalSnapshots, Project, Snapshot } from '../lib/dataService';
 
 const COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f43f5e'];
 
@@ -62,20 +44,12 @@ export default function Analytics() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [projectsRes, snapshotsRes] = await Promise.all([
-        fetch('/api/projects'),
-        fetch('/api/snapshots/history')
+      const [fetchedProjects, fetchedSnapshots] = await Promise.all([
+        getProjects(),
+        getHistoricalSnapshots()
       ]);
-      let pData: any = [];
-      let sData: any = [];
-      try {
-        pData = await projectsRes.json();
-      } catch (_) {}
-      try {
-        sData = await snapshotsRes.json();
-      } catch (_) {}
-      setProjects(Array.isArray(pData) ? pData : []);
-      setSnapshots(Array.isArray(sData) ? sData : []);
+      setProjects(fetchedProjects);
+      setSnapshots(fetchedSnapshots);
     } catch (error) {
       console.error('Failed to fetch analytics data', error);
     } finally {
@@ -304,7 +278,7 @@ export default function Analytics() {
           </div>
         ) : (
           <div className="h-[350px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" minWidth={0}>
               <LineChart data={lineChartData} margin={{ top: 10, right: 30, left: 10, bottom: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f4f4f5" />
                 <XAxis 
@@ -374,7 +348,7 @@ export default function Analytics() {
             </div>
           ) : (
             <div className="h-[280px] w-full">
-              <ResponsiveContainer width="100%" height="100%">
+              <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                 <BarChart data={landData} margin={{ top: 10, right: 10, left: 0, bottom: 10 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f4f4f5" />
                   <XAxis dataKey="name" tickLine={false} axisLine={false} stroke="#a1a1aa" fontSize={11} dy={10} />
@@ -412,7 +386,7 @@ export default function Analytics() {
           ) : (
             <div className="h-[280px] flex flex-col sm:flex-row items-center gap-6">
               <div className="w-full sm:w-1/2 h-full">
-                <ResponsiveContainer width="100%" height="100%">
+                <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                   <PieChart>
                     <Pie
                       data={pieData}

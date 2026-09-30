@@ -1,18 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Activity, ArrowUpRight, ArrowDownRight, Info, CalendarClock, Trash2, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
-
-interface Delta {
-  id: string;
-  project_id: string;
-  change_type: string;
-  description: string;
-  created_at: string;
-}
-
-interface Project {
-  id: string;
-  name: string;
-}
+import { getWeeklyDeltas, getProjects, getWeeklyUpdates, WeeklyDelta, Project } from '../lib/dataService';
 
 interface WeeklyUpdate {
   id: number;
@@ -27,7 +15,7 @@ interface WeeklyUpdate {
 export default function Deltas() {
   const [activeTab, setActiveTab] = useState<'insights' | 'snapshots'>('insights');
   
-  const [deltas, setDeltas] = useState<Delta[]>([]);
+  const [deltas, setDeltas] = useState<WeeklyDelta[]>([]);
   const [projects, setProjects] = useState<Record<string, string>>({});
   const [loadingDeltas, setLoadingDeltas] = useState(true);
 
@@ -43,29 +31,18 @@ export default function Deltas() {
   const fetchDeltasData = async () => {
     setLoadingDeltas(true);
     try {
-      const [deltasRes, projectsRes] = await Promise.all([
-        fetch('/api/deltas'),
-        fetch('/api/projects')
+      const [deltasData, projectsData] = await Promise.all([
+        getWeeklyDeltas(),
+        getProjects()
       ]);
       
-      let deltasData: any = [];
-      let projectsData: any = [];
-      try {
-        deltasData = await deltasRes.json();
-      } catch (_) {}
-      try {
-        projectsData = await projectsRes.json();
-      } catch (_) {}
-      
       const projMap: Record<string, string> = {};
-      if (Array.isArray(projectsData)) {
-        projectsData.forEach((p: Project) => {
-          projMap[p.id] = p.name;
-        });
-      }
+      projectsData.forEach((p: Project) => {
+        projMap[p.id] = p.name;
+      });
       
       setProjects(projMap);
-      setDeltas(Array.isArray(deltasData) ? deltasData : []);
+      setDeltas(deltasData);
     } catch (error) {
       console.error('Failed to fetch deltas', error);
     } finally {
@@ -76,11 +53,7 @@ export default function Deltas() {
   const fetchSavedUpdates = async () => {
     setLoadingUpdates(true);
     try {
-      const res = await fetch('/api/weekly_updates');
-      let updates = [];
-      try {
-        updates = await res.json();
-      } catch (_) {}
+      const updates = await getWeeklyUpdates();
       setSavedUpdates(Array.isArray(updates) ? updates : []);
     } catch (error) {
       console.error('Failed to fetch weekly updates', error);

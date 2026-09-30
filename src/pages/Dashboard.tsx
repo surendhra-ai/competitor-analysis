@@ -2,26 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Building2, RefreshCw, Download, Printer, Settings2, Save, X, CalendarClock } from 'lucide-react';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
-
-interface Project {
-  id: string;
-  name: string;
-}
-
-interface Snapshot {
-  id: string;
-  project_id: string;
-  scraped_at: string;
-  no_of_units: number | null;
-  no_of_floors: number | null;
-  land_area_acres: number | null;
-  base_price_per_sft: number | null;
-  landed_price_per_sft: number | null;
-  construction_stage: string | null;
-  handover_date: string | null;
-  schemes: string[] | null;
-  social_ads_summary: string | null;
-}
+import { getProjects, getLatestSnapshots, saveWeeklyUpdate, Project, Snapshot } from '../lib/dataService';
 
 const ALL_ATTRIBUTES = [
   { key: 'no_of_units', label: 'Total Units' },
@@ -55,20 +36,10 @@ export default function Dashboard() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [projectsRes, snapshotsRes] = await Promise.all([
-        fetch('/api/projects'),
-        fetch('/api/snapshots/latest')
+      const [fetchedProjects, fetchedSnapshots] = await Promise.all([
+        getProjects(),
+        getLatestSnapshots()
       ]);
-      let projectsData: any = [];
-      let snapshotsData: any = [];
-      try {
-        projectsData = await projectsRes.json();
-      } catch (_) {}
-      try {
-        snapshotsData = await snapshotsRes.json();
-      } catch (_) {}
-      const fetchedProjects = Array.isArray(projectsData) ? projectsData : [];
-      const fetchedSnapshots = Array.isArray(snapshotsData) ? snapshotsData : [];
 
       setProjects(fetchedProjects);
       setSnapshots(fetchedSnapshots);
@@ -105,17 +76,8 @@ export default function Dashboard() {
         attributes: displayedAttributes
       };
       
-      const res = await fetch('/api/weekly_updates', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: dataToSave })
-      });
-      
-      if (res.ok) {
-        alert('Saved to Weekly Updates successfully!');
-      } else {
-        throw new Error('Failed to save');
-      }
+      await saveWeeklyUpdate(dataToSave);
+      alert('Saved to Weekly Updates successfully!');
     } catch (error) {
       console.error(error);
       alert('Failed to save weekly update.');

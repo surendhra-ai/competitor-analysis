@@ -427,6 +427,17 @@ async function startServer() {
   const app = express();
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
+  // Enable CORS for external access / microservices
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(200);
+    }
+    next();
+  });
+
   app.use(express.json());
 
   app.get('/api/env-check', (req, res) => {
@@ -1412,6 +1423,11 @@ async function startServer() {
       console.error('Error in /api/scrape:', error);
       res.status(500).json({ error: error.message });
     }
+  });
+
+  // Explicit catch-all for unknown /api/* routes so they NEVER return HTML
+  app.all('/api/*', (req, res) => {
+    res.status(404).json({ error: `API route ${req.method} ${req.path} not found.` });
   });
 
   // Vite middleware for development vs Express static for production
