@@ -59,8 +59,14 @@ export default function Dashboard() {
         fetch('/api/projects'),
         fetch('/api/snapshots/latest')
       ]);
-      const projectsData = await projectsRes.json();
-      const snapshotsData = await snapshotsRes.json();
+      let projectsData: any = [];
+      let snapshotsData: any = [];
+      try {
+        projectsData = await projectsRes.json();
+      } catch (_) {}
+      try {
+        snapshotsData = await snapshotsRes.json();
+      } catch (_) {}
       const fetchedProjects = Array.isArray(projectsData) ? projectsData : [];
       const fetchedSnapshots = Array.isArray(snapshotsData) ? snapshotsData : [];
 

@@ -9,7 +9,7 @@ import dotenv from 'dotenv';
 
 dotenv.config({ override: true });
 
-// We keep SQLite ONLY for local settings (API keys)
+// Local SQLite database for persistent storage (works out-of-the-box in Coolify, Docker, or local)
 const db = new Database('realintel.db');
 
 db.exec(`
@@ -22,8 +22,36 @@ db.exec(`
       timestamp TEXT,
       data TEXT
   );
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('supabaseUrl', 'https://supabase.trusync.cloud');
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('supabaseKey', 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc2MTE1NjAwMCwiZXhwIjo0OTE2ODI5NjAwLCJyb2xlIjoiYW5vbiJ9.-QMXM4M6Jpr2IYdpqd2QcUioKRz4b3N90c1Rxk_RUIM');
+  CREATE TABLE IF NOT EXISTS local_projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      location TEXT,
+      official_url TEXT,
+      rera_registration_number TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS local_project_snapshots (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      scraped_at TEXT DEFAULT (datetime('now')),
+      no_of_units INTEGER,
+      no_of_floors INTEGER,
+      land_area_acres REAL,
+      base_price_per_sft REAL,
+      landed_price_per_sft REAL,
+      construction_stage TEXT,
+      handover_date TEXT,
+      schemes TEXT,
+      social_ads_summary TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS local_weekly_deltas (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      change_type TEXT,
+      description TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 // Auto-migrate legacy or high-tier Gemini models that exceed the free quota
@@ -170,6 +198,20 @@ CREATE POLICY "Public access to project_snapshots" ON public.project_snapshots F
 DROP POLICY IF EXISTS "Public access to weekly_deltas" ON public.weekly_deltas;
 CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL USING (true) WITH CHECK (true);`;
 
+function formatSupabaseErrorMessage(err: any): string {
+  const msg = err?.message || String(err || '');
+  if (msg.includes("Unexpected token '<'") || msg.includes("<!doctype") || msg.includes("is not valid JSON") || msg.includes("SyntaxError")) {
+    return "The Supabase URL returned an HTML webpage instead of the Supabase API (Received: <!doctype html...). Please check your Supabase URL: it should be your Supabase REST API endpoint (e.g. https://<project-ref>.supabase.co or your self-hosted Kong endpoint http://host:8000), NOT your frontend dashboard, app URL, or web browser URL.";
+  }
+  if (msg.includes("fetch failed") || msg.includes("ENOTFOUND") || msg.includes("ECONNREFUSED") || msg.includes("ERR_NAME_NOT_RESOLVED")) {
+    return `Could not reach the host at ${err?.hostname || 'the specified Supabase URL'}. Please verify your domain, network, and firewall settings.`;
+  }
+  if (msg.includes("JWT") || msg.includes("apikey") || msg.includes("401") || msg.includes("403")) {
+    return "Supabase API authentication failed. Verify that your Supabase Anon Key (or Service Role Key) is accurate.";
+  }
+  return msg;
+}
+
 function getEffectiveSupabaseCredentials() {
   const urlRow = db.prepare("SELECT value FROM settings WHERE key = 'supabaseUrl'").get() as any;
   const keyRow = db.prepare("SELECT value FROM settings WHERE key = 'supabaseKey'").get() as any;
@@ -181,60 +223,91 @@ function getEffectiveSupabaseCredentials() {
   let key = (keyRow?.value || '').trim();
   let source = 'database';
 
-  // If DB setting is empty or default demo cloud, and environment variables exist (e.g. in Coolify)
-  if (envUrl && (!url || url === 'https://supabase.trusync.cloud')) {
+  // If DB setting is empty, check environment variables (Coolify)
+  if (!url && envUrl) {
     url = envUrl;
     key = envKey || key;
     source = 'environment';
-  } else if (!url && envUrl) {
-    url = envUrl;
-    key = envKey || key;
-    source = 'environment';
-  } else if (!url) {
-    url = 'https://supabase.trusync.cloud';
-    key = key || 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc2MTE1NjAwMCwiZXhwIjo0OTE2ODI5NjAwLCJyb2xlIjoiYW5vbiJ9.-QMXM4M6Jpr2IYdpqd2QcUioKRz4b3N90c1Rxk_RUIM';
-    source = 'default';
   }
 
-  return { url, key, source };
+  return { url, key, source: url ? source : 'none' };
 }
 
 function getSupabase() {
   const { url, key } = getEffectiveSupabaseCredentials();
   if (!url || !key) {
-    throw new Error("Supabase credentials not configured. Please set Project URL and Anon Key in Settings or environment variables.");
+    return null;
   }
   return createClient(url, key);
 }
 
 function parseJsonSafely(text: string) {
   if (!text) throw new Error("Empty response from LLM");
-  const trimmed = text.trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch (e) {
-    const match = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-    if (match) {
+  let cleaned = text.trim();
+
+  // Strip <think>...</think> blocks from reasoning models (e.g. DeepSeek-R1)
+  cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+
+  // If text starts with conversational thinking prelude, look for code blocks
+  const codeBlockRegex = /```(?:json)?\s*([\s\S]*?)```/gi;
+  const matches = [...cleaned.matchAll(codeBlockRegex)];
+  if (matches.length > 0) {
+    // Try code blocks from last to first (reasoning models typically put final output in last block)
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const blockContent = matches[i][1].trim();
       try {
-        return JSON.parse(match[1].trim());
-      } catch (_) {}
+        return JSON.parse(blockContent);
+      } catch (_) {
+        try {
+          const withoutTrailingCommas = blockContent.replace(/,\s*([}\]])/g, '$1');
+          return JSON.parse(withoutTrailingCommas);
+        } catch (_) {}
+      }
     }
-    const firstBrace = trimmed.indexOf('{');
-    const lastBrace = trimmed.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      try {
-        return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
-      } catch (_) {}
-    }
-    const firstBracket = trimmed.indexOf('[');
-    const lastBracket = trimmed.lastIndexOf(']');
-    if (firstBracket !== -1 && lastBracket > firstBracket) {
-      try {
-        return JSON.parse(trimmed.slice(firstBracket, lastBracket + 1));
-      } catch (_) {}
-    }
-    throw new Error(`Failed to parse LLM JSON output: ${trimmed.slice(0, 300)}...`);
   }
+
+  // Direct parse attempt
+  try {
+    return JSON.parse(cleaned);
+  } catch (_) {}
+
+  // Attempt removing trailing commas
+  try {
+    const withoutTrailingCommas = cleaned.replace(/,\s*([}\]])/g, '$1');
+    return JSON.parse(withoutTrailingCommas);
+  } catch (_) {}
+
+  // Extract from first { to last }
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const candidate = cleaned.slice(firstBrace, lastBrace + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch (_) {
+      try {
+        const withoutTrailingCommas = candidate.replace(/,\s*([}\]])/g, '$1');
+        return JSON.parse(withoutTrailingCommas);
+      } catch (_) {}
+    }
+  }
+
+  // Extract from first [ to last ]
+  const firstBracket = cleaned.indexOf('[');
+  const lastBracket = cleaned.lastIndexOf(']');
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    const candidate = cleaned.slice(firstBracket, lastBracket + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch (_) {
+      try {
+        const withoutTrailingCommas = candidate.replace(/,\s*([}\]])/g, '$1');
+        return JSON.parse(withoutTrailingCommas);
+      } catch (_) {}
+    }
+  }
+
+  throw new Error(`Failed to parse LLM JSON output: ${cleaned.slice(0, 300)}...`);
 }
 
 async function callLLM(promptText: string, schema: any, customConfig?: { baseUrl?: string; model?: string; apiKey?: string }) {
@@ -364,67 +437,79 @@ async function startServer() {
   app.get('/api/supabase/status', async (req, res) => {
     try {
       const { url, key, source } = getEffectiveSupabaseCredentials();
+      const localCountRow = db.prepare("SELECT COUNT(*) as count FROM local_projects").get() as any;
+      const localProjectCount = localCountRow?.count ?? 0;
+
       if (!url || !key) {
         return res.json({
           configured: false,
           connected: false,
-          source,
+          source: 'none',
           url: '',
+          localProjectCount,
           tables: { projects: false, project_snapshots: false, weekly_deltas: false },
-          error: "Supabase credentials are not configured. Please set Project URL and Anon Key in Settings or Coolify environment variables.",
+          projectCount: localProjectCount,
+          error: 'No Supabase credentials configured. The app is currently using the local SQLite database. All projects, snapshots, and deltas are stored locally.',
           schemaSql: SUPABASE_SQL_SCHEMA
         });
       }
 
-      const supabase = createClient(url, key);
       const results = {
         configured: true,
         connected: false,
         source,
         url,
+        localProjectCount,
         tables: {
           projects: false,
           project_snapshots: false,
           weekly_deltas: false
         },
-        projectCount: 0,
+        projectCount: localProjectCount,
         error: null as string | null,
         schemaSql: SUPABASE_SQL_SCHEMA
       };
 
-      // 1. Check projects table
-      const projCheck = await supabase.from('projects').select('id', { count: 'exact' }).limit(1);
-      if (projCheck.error) {
-        results.connected = false;
-        if (projCheck.error.code === '42P01') {
-          results.error = "Connected to Supabase, but the 'projects' table does not exist. Please run the SQL schema script in your Supabase SQL Editor.";
-        } else if (projCheck.error.message?.includes('JWT') || projCheck.error.message?.includes('apikey')) {
-          results.error = "Authentication failed: Supabase Anon/API Key is invalid or expired.";
-        } else {
-          results.error = `Supabase query error: ${projCheck.error.message} (code: ${projCheck.error.code || 'unknown'})`;
+      try {
+        const supabase = createClient(url, key);
+        // 1. Check projects table
+        const projCheck = await supabase.from('projects').select('id', { count: 'exact' }).limit(1);
+        if (projCheck.error) {
+          results.connected = false;
+          if (projCheck.error.code === '42P01') {
+            results.error = "Connected to Supabase, but the 'projects' table does not exist. Please run the SQL schema script in your Supabase SQL Editor.";
+          } else if (projCheck.error.message?.includes('JWT') || projCheck.error.message?.includes('apikey')) {
+            results.error = "Authentication failed: Supabase Anon/API Key is invalid or expired.";
+          } else {
+            results.error = formatSupabaseErrorMessage(projCheck.error);
+          }
+          return res.json(results);
         }
-        return res.json(results);
+
+        results.connected = true;
+        results.tables.projects = true;
+        results.projectCount = projCheck.count ?? 0;
+
+        // 2. Check snapshots table
+        const snapCheck = await supabase.from('project_snapshots').select('id').limit(1);
+        results.tables.project_snapshots = !snapCheck.error;
+
+        // 3. Check deltas table
+        const deltaCheck = await supabase.from('weekly_deltas').select('id').limit(1);
+        results.tables.weekly_deltas = !deltaCheck.error;
+
+        res.json(results);
+      } catch (clientErr: any) {
+        results.connected = false;
+        results.error = formatSupabaseErrorMessage(clientErr);
+        res.json(results);
       }
-
-      results.connected = true;
-      results.tables.projects = true;
-      results.projectCount = projCheck.count ?? 0;
-
-      // 2. Check snapshots table
-      const snapCheck = await supabase.from('project_snapshots').select('id').limit(1);
-      results.tables.project_snapshots = !snapCheck.error;
-
-      // 3. Check deltas table
-      const deltaCheck = await supabase.from('weekly_deltas').select('id').limit(1);
-      results.tables.weekly_deltas = !deltaCheck.error;
-
-      res.json(results);
     } catch (err: any) {
       console.error('Error in /api/supabase/status:', err);
       res.json({
-        configured: true,
+        configured: false,
         connected: false,
-        error: err.message || 'Failed to connect to Supabase.',
+        error: formatSupabaseErrorMessage(err),
         schemaSql: SUPABASE_SQL_SCHEMA
       });
     }
@@ -437,34 +522,87 @@ async function startServer() {
         return res.status(400).json({ success: false, error: 'Both Supabase URL and Anon Key are required for testing.' });
       }
 
-      const client = createClient(supabaseUrl.trim(), supabaseKey.trim());
-      const testRes = await client.from('projects').select('id', { count: 'exact' }).limit(1);
+      try {
+        const client = createClient(supabaseUrl.trim(), supabaseKey.trim());
+        const testRes = await client.from('projects').select('id', { count: 'exact' }).limit(1);
 
-      if (testRes.error) {
-        if (testRes.error.code === '42P01') {
+        if (testRes.error) {
+          if (testRes.error.code === '42P01') {
+            return res.json({
+              success: true,
+              connected: true,
+              tablesExist: false,
+              message: "Connected to Supabase successfully, but the 'projects' table does not exist yet. Please run the SQL schema in your Supabase SQL Editor."
+            });
+          }
           return res.json({
-            success: true,
-            connected: true,
-            tablesExist: false,
-            message: "Connected to Supabase successfully, but the 'projects' table does not exist yet. Please run the SQL schema in your Supabase SQL Editor."
+            success: false,
+            connected: false,
+            error: formatSupabaseErrorMessage(testRes.error)
           });
         }
-        return res.json({
+
+        res.json({
+          success: true,
+          connected: true,
+          tablesExist: true,
+          count: testRes.count ?? 0,
+          message: `Connected successfully! 'projects' table found with ${testRes.count ?? 0} project(s).`
+        });
+      } catch (clientErr: any) {
+        res.json({
           success: false,
           connected: false,
-          error: testRes.error.message
+          error: formatSupabaseErrorMessage(clientErr)
         });
       }
-
-      res.json({
-        success: true,
-        connected: true,
-        tablesExist: true,
-        count: testRes.count ?? 0,
-        message: `Connected successfully! 'projects' table found with ${testRes.count ?? 0} project(s).`
-      });
     } catch (err: any) {
-      res.json({ success: false, connected: false, error: err.message || 'Connection test failed.' });
+      res.json({ success: false, connected: false, error: formatSupabaseErrorMessage(err) });
+    }
+  });
+
+  // --- Supabase Sync (Local <-> Supabase) ---
+  app.post('/api/supabase/sync', async (req, res) => {
+    try {
+      const supabase = getSupabase();
+      if (!supabase) {
+        return res.status(400).json({ error: 'Supabase is not configured yet. Please enter credentials in Settings.' });
+      }
+
+      const localProjects = db.prepare("SELECT * FROM local_projects").all() as any[];
+      let syncedCount = 0;
+      for (const p of localProjects) {
+        const { error } = await supabase.from('projects').upsert({
+          id: p.id,
+          name: p.name,
+          location: p.location,
+          official_url: p.official_url,
+          rera_registration_number: p.rera_registration_number,
+          created_at: p.created_at
+        }, { onConflict: 'id' });
+        if (!error) syncedCount++;
+      }
+
+      // Also pull projects from Supabase to local
+      const { data: remoteProjects, error: fetchErr } = await supabase.from('projects').select('*');
+      if (!fetchErr && remoteProjects) {
+        const insertStmt = db.prepare(`
+          INSERT INTO local_projects (id, name, location, official_url, rera_registration_number, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,
+            location=excluded.location,
+            official_url=excluded.official_url,
+            rera_registration_number=excluded.rera_registration_number
+        `);
+        for (const rp of remoteProjects) {
+          insertStmt.run(rp.id, rp.name, rp.location, rp.official_url, rp.rera_registration_number, rp.created_at);
+        }
+      }
+
+      res.json({ success: true, syncedCount, totalProjects: remoteProjects?.length || localProjects.length });
+    } catch (err: any) {
+      res.status(500).json({ error: formatSupabaseErrorMessage(err) });
     }
   });
 
@@ -586,36 +724,92 @@ async function startServer() {
   app.get('/api/projects', async (req, res) => {
     try {
       const supabase = getSupabase();
-      const { data, error } = await supabase.from('projects').select('*').order('created_at', { ascending: false });
-      if (error) {
-        console.error('Supabase get /api/projects error:', error);
-        return res.status(500).json({ error: error.message, code: error.code });
+      if (supabase) {
+        try {
+          const { data, error } = await supabase.from('projects').select('*').order('created_at', { ascending: false });
+          if (!error && Array.isArray(data)) {
+            // Background sync into local SQLite
+            const upsertStmt = db.prepare(`
+              INSERT INTO local_projects (id, name, location, official_url, rera_registration_number, created_at)
+              VALUES (?, ?, ?, ?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                location=excluded.location,
+                official_url=excluded.official_url,
+                rera_registration_number=excluded.rera_registration_number
+            `);
+            for (const p of data) {
+              upsertStmt.run(p.id, p.name, p.location, p.official_url, p.rera_registration_number, p.created_at);
+            }
+            return res.json(data);
+          }
+        } catch (supErr: any) {
+          console.warn('Supabase fetch failed, falling back to local SQLite:', formatSupabaseErrorMessage(supErr));
+        }
       }
-      res.json(data || []);
+
+      // Fallback to local SQLite database (always returns 200 OK!)
+      const localList = db.prepare("SELECT * FROM local_projects ORDER BY created_at DESC").all();
+      res.json(localList);
     } catch (error: any) {
       console.error('Projects GET failure:', error.message);
-      res.status(500).json({ error: error.message });
+      res.json([]); // Return empty list instead of 500 so UI never crashes
     }
   });
 
   app.post('/api/projects', async (req, res) => {
     try {
-      const supabase = getSupabase();
       const { name, location, official_url, rera_registration_number } = req.body;
       if (!name || !name.trim()) {
         return res.status(400).json({ error: 'Project name is required.' });
       }
-      const { data, error } = await supabase.from('projects').insert([{ 
-        name: name.trim(),
-        location: location?.trim() || null,
-        official_url: official_url?.trim() || null,
-        rera_registration_number: rera_registration_number?.trim() || null
-      }]).select().single();
-      if (error) {
-        console.error('Supabase post /api/projects error:', error);
-        return res.status(500).json({ error: error.message, code: error.code });
+
+      const id = crypto.randomUUID();
+      const trimmedName = name.trim();
+      const loc = location?.trim() || null;
+      const url = official_url?.trim() || null;
+      const rera = rera_registration_number?.trim() || null;
+      const now = new Date().toISOString();
+
+      // 1. Always save into local SQLite database first!
+      const stmt = db.prepare(`
+        INSERT INTO local_projects (id, name, location, official_url, rera_registration_number, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(id, trimmedName, loc, url, rera, now);
+
+      const savedProject = {
+        id,
+        name: trimmedName,
+        location: loc,
+        official_url: url,
+        rera_registration_number: rera,
+        created_at: now
+      };
+
+      // 2. Also save to Supabase if configured
+      const supabase = getSupabase();
+      if (supabase) {
+        try {
+          const { data, error } = await supabase.from('projects').insert([{
+            id,
+            name: trimmedName,
+            location: loc,
+            official_url: url,
+            rera_registration_number: rera
+          }]).select().single();
+          if (!error && data) {
+            return res.json(data);
+          }
+          if (error) {
+            console.warn('Supabase project insert failed, saved to local SQLite:', formatSupabaseErrorMessage(error));
+          }
+        } catch (supErr: any) {
+          console.warn('Supabase project insert exception, saved to local SQLite:', formatSupabaseErrorMessage(supErr));
+        }
       }
-      res.json(data);
+
+      res.json(savedProject);
     } catch (error: any) {
       console.error('Projects POST failure:', error.message);
       res.status(500).json({ error: error.message });
@@ -624,23 +818,43 @@ async function startServer() {
 
   app.put('/api/projects/:id', async (req, res) => {
     try {
-      const supabase = getSupabase();
       const { id } = req.params;
       const { name, location, official_url, rera_registration_number } = req.body;
-      const { data, error } = await supabase.from('projects')
-        .update({
-          name: name?.trim(),
-          location: location?.trim() || null,
-          official_url: official_url?.trim() || null,
-          rera_registration_number: rera_registration_number?.trim() || null
-        })
-        .eq('id', id)
-        .select().single();
-      if (error) {
-        console.error('Supabase put /api/projects error:', error);
-        return res.status(500).json({ error: error.message, code: error.code });
+      const trimmedName = name?.trim();
+      const loc = location?.trim() || null;
+      const url = official_url?.trim() || null;
+      const rera = rera_registration_number?.trim() || null;
+
+      // Update local SQLite
+      db.prepare(`
+        UPDATE local_projects
+        SET name = coalesce(?, name),
+            location = coalesce(?, location),
+            official_url = coalesce(?, official_url),
+            rera_registration_number = coalesce(?, rera_registration_number)
+        WHERE id = ?
+      `).run(trimmedName, loc, url, rera, id);
+
+      const updated = db.prepare("SELECT * FROM local_projects WHERE id = ?").get(id);
+
+      // Also update Supabase if configured
+      const supabase = getSupabase();
+      if (supabase) {
+        try {
+          await supabase.from('projects')
+            .update({
+              name: trimmedName,
+              location: loc,
+              official_url: url,
+              rera_registration_number: rera
+            })
+            .eq('id', id);
+        } catch (supErr: any) {
+          console.warn('Supabase update failed:', formatSupabaseErrorMessage(supErr));
+        }
       }
-      res.json(data);
+
+      res.json(updated);
     } catch (error: any) {
       console.error('Projects PUT failure:', error.message);
       res.status(500).json({ error: error.message });
@@ -649,13 +863,22 @@ async function startServer() {
 
   app.delete('/api/projects/:id', async (req, res) => {
     try {
-      const supabase = getSupabase();
       const { id } = req.params;
-      const { error } = await supabase.from('projects').delete().eq('id', id);
-      if (error) {
-        console.error('Supabase delete /api/projects error:', error);
-        return res.status(500).json({ error: error.message, code: error.code });
+      // Delete locally
+      db.prepare("DELETE FROM local_projects WHERE id = ?").run(id);
+      db.prepare("DELETE FROM local_project_snapshots WHERE project_id = ?").run(id);
+      db.prepare("DELETE FROM local_weekly_deltas WHERE project_id = ?").run(id);
+
+      // Also delete from Supabase if configured
+      const supabase = getSupabase();
+      if (supabase) {
+        try {
+          await supabase.from('projects').delete().eq('id', id);
+        } catch (supErr: any) {
+          console.warn('Supabase delete failed:', formatSupabaseErrorMessage(supErr));
+        }
       }
+
       res.json({ success: true });
     } catch (error: any) {
       console.error('Projects DELETE failure:', error.message);
@@ -667,54 +890,96 @@ async function startServer() {
   app.get('/api/snapshots/latest', async (req, res) => {
     try {
       const supabase = getSupabase();
-      const { data, error } = await supabase
-        .from('project_snapshots')
-        .select('*')
-        .order('scraped_at', { ascending: false });
-        
-      if (error) throw error;
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from('project_snapshots')
+            .select('*')
+            .order('scraped_at', { ascending: false });
+          if (!error && Array.isArray(data)) {
+            const latestSnapshots: any[] = [];
+            const seen = new Set();
+            for (const row of data) {
+              if (!seen.has(row.project_id)) {
+                seen.add(row.project_id);
+                latestSnapshots.push(row);
+              }
+            }
+            return res.json(latestSnapshots);
+          }
+        } catch (supErr) {
+          console.warn('Supabase snapshots/latest failed, using local SQLite:', supErr);
+        }
+      }
 
+      // Local fallback
+      const localRows = db.prepare("SELECT * FROM local_project_snapshots ORDER BY scraped_at DESC").all() as any[];
       const latestSnapshots: any[] = [];
       const seen = new Set();
-      for (const row of (data || [])) {
+      for (const row of localRows) {
         if (!seen.has(row.project_id)) {
           seen.add(row.project_id);
-          latestSnapshots.push(row);
+          latestSnapshots.push({
+            ...row,
+            schemes: typeof row.schemes === 'string' ? JSON.parse(row.schemes || '[]') : (row.schemes || [])
+          });
         }
       }
       res.json(latestSnapshots);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.json([]);
     }
   });
 
   app.get('/api/snapshots/history', async (req, res) => {
     try {
       const supabase = getSupabase();
-      const { data, error } = await supabase
-        .from('project_snapshots')
-        .select('*')
-        .order('scraped_at', { ascending: true });
-        
-      if (error) throw error;
-      res.json(data || []);
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from('project_snapshots')
+            .select('*')
+            .order('scraped_at', { ascending: true });
+          if (!error && Array.isArray(data)) {
+            return res.json(data);
+          }
+        } catch (supErr) {
+          console.warn('Supabase snapshots/history failed, using local SQLite:', supErr);
+        }
+      }
+
+      const localRows = db.prepare("SELECT * FROM local_project_snapshots ORDER BY scraped_at ASC").all() as any[];
+      res.json(localRows.map((r: any) => ({
+        ...r,
+        schemes: typeof r.schemes === 'string' ? JSON.parse(r.schemes || '[]') : (r.schemes || [])
+      })));
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.json([]);
     }
   });
 
   app.get('/api/deltas', async (req, res) => {
     try {
       const supabase = getSupabase();
-      const { data, error } = await supabase
-        .from('weekly_deltas')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(50);
-      if (error) throw error;
-      res.json(data || []);
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from('weekly_deltas')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(50);
+          if (!error && Array.isArray(data)) {
+            return res.json(data);
+          }
+        } catch (supErr) {
+          console.warn('Supabase deltas failed, using local SQLite:', supErr);
+        }
+      }
+
+      const localDeltas = db.prepare("SELECT * FROM local_weekly_deltas ORDER BY created_at DESC LIMIT 50").all();
+      res.json(localDeltas);
     } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.json([]);
     }
   });
 
@@ -723,17 +988,18 @@ async function startServer() {
     const { projectId } = req.body;
     
     try {
+      // 1. Fetch project from local SQLite or Supabase
+      let project = db.prepare("SELECT * FROM local_projects WHERE id = ?").get(projectId) as any;
       const supabase = getSupabase();
-      
-      const { data: project, error: projError } = await supabase
-        .from('projects')
-        .select('*')
-        .eq('id', projectId)
-        .single();
-        
-      if (projError || !project) {
-        console.error('Project not found in Supabase:', projError);
-        return res.status(404).json({ error: 'Project not found in Supabase' });
+      if (!project && supabase) {
+        try {
+          const { data } = await supabase.from('projects').select('*').eq('id', projectId).single();
+          if (data) project = data;
+        } catch (_) {}
+      }
+
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found in local or remote database.' });
       }
 
       const settingsRows = db.prepare("SELECT * FROM settings").all() as any[];
@@ -867,35 +1133,61 @@ async function startServer() {
       }
 
       // 3. Get previous snapshot to generate deltas
-      const { data: previousSnapshot, error: prevSnapError } = await supabase
-        .from('project_snapshots')
-        .select('*')
-        .eq('project_id', project.id)
-        .order('scraped_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (prevSnapError) {
-        console.error('Error fetching previous snapshot:', prevSnapError);
+      let previousSnapshot = db.prepare("SELECT * FROM local_project_snapshots WHERE project_id = ? ORDER BY scraped_at DESC LIMIT 1").get(project.id) as any;
+      if (previousSnapshot && typeof previousSnapshot.schemes === 'string') {
+        try { previousSnapshot.schemes = JSON.parse(previousSnapshot.schemes); } catch (_) {}
+      }
+      if (!previousSnapshot && supabase) {
+        try {
+          const { data: remoteSnap } = await supabase.from('project_snapshots').select('*').eq('project_id', project.id).order('scraped_at', { ascending: false }).limit(1).maybeSingle();
+          if (remoteSnap) previousSnapshot = remoteSnap;
+        } catch (_) {}
       }
 
-      // 4. Save new snapshot
-      const { error: snapError } = await supabase.from('project_snapshots').insert([{
-        project_id: project.id,
-        no_of_units: extractedData.no_of_units,
-        no_of_floors: extractedData.no_of_floors,
-        land_area_acres: extractedData.land_area_acres,
-        base_price_per_sft: extractedData.base_price_per_sft,
-        landed_price_per_sft: extractedData.landed_price_per_sft,
-        construction_stage: extractedData.construction_stage,
-        handover_date: extractedData.handover_date,
-        schemes: extractedData.schemes || [],
-        social_ads_summary: extractedData.social_ads_summary
-      }]);
-      
-      if (snapError) {
-        console.error('Error inserting new snapshot:', snapError);
-        throw snapError;
+      // 4. Save new snapshot to local SQLite
+      const snapshotId = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
+
+      db.prepare(`
+        INSERT INTO local_project_snapshots (
+          id, project_id, scraped_at, no_of_units, no_of_floors, land_area_acres,
+          base_price_per_sft, landed_price_per_sft, construction_stage, handover_date, schemes, social_ads_summary, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        snapshotId,
+        project.id,
+        nowIso,
+        extractedData.no_of_units ?? null,
+        extractedData.no_of_floors ?? null,
+        extractedData.land_area_acres ?? null,
+        extractedData.base_price_per_sft ?? null,
+        extractedData.landed_price_per_sft ?? null,
+        extractedData.construction_stage ?? null,
+        extractedData.handover_date ?? null,
+        JSON.stringify(extractedData.schemes || []),
+        extractedData.social_ads_summary ?? null,
+        nowIso
+      );
+
+      // Also save to Supabase if available
+      if (supabase) {
+        try {
+          await supabase.from('project_snapshots').insert([{
+            id: snapshotId,
+            project_id: project.id,
+            no_of_units: extractedData.no_of_units,
+            no_of_floors: extractedData.no_of_floors,
+            land_area_acres: extractedData.land_area_acres,
+            base_price_per_sft: extractedData.base_price_per_sft,
+            landed_price_per_sft: extractedData.landed_price_per_sft,
+            construction_stage: extractedData.construction_stage,
+            handover_date: extractedData.handover_date,
+            schemes: extractedData.schemes || [],
+            social_ads_summary: extractedData.social_ads_summary
+          }]);
+        } catch (snapError: any) {
+          console.warn('Failed to insert snapshot into Supabase, local copy saved:', snapError.message);
+        }
       }
 
       // 5. Generate Incremental Updates (Weekly Deltas) using AI
@@ -932,27 +1224,40 @@ async function startServer() {
             changes = [];
           }
         } catch (error: any) {
-          return res.status(400).json({ error: error.message });
+          console.warn('Delta generation failed:', error.message);
         }
         
         if (changes.length > 0) {
-          const deltaInserts = changes.map((c: any) => ({
-            project_id: project.id,
-            change_type: c.change_type,
-            description: c.description
-          }));
-          await supabase.from('weekly_deltas').insert(deltaInserts);
+          const insertDelta = db.prepare(`
+            INSERT INTO local_weekly_deltas (id, project_id, change_type, description, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+          `);
+          for (const c of changes) {
+            insertDelta.run(crypto.randomUUID(), project.id, c.change_type, c.description);
+          }
+
+          if (supabase) {
+            try {
+              const deltaInserts = changes.map((c: any) => ({
+                project_id: project.id,
+                change_type: c.change_type,
+                description: c.description
+              }));
+              await supabase.from('weekly_deltas').insert(deltaInserts);
+            } catch (supErr: any) {
+              console.warn('Failed to insert deltas into Supabase, local saved:', supErr.message);
+            }
+          }
         }
       }
 
-      res.json({ success: true });
+      res.json({ success: true, extractedData });
 
     } catch (error: any) {
       console.error('Error in /api/scrape:', error);
       res.status(500).json({ error: error.message });
     }
   });
-
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {

@@ -48,8 +48,14 @@ export default function Deltas() {
         fetch('/api/projects')
       ]);
       
-      const deltasData = await deltasRes.json();
-      const projectsData = await projectsRes.json();
+      let deltasData: any = [];
+      let projectsData: any = [];
+      try {
+        deltasData = await deltasRes.json();
+      } catch (_) {}
+      try {
+        projectsData = await projectsRes.json();
+      } catch (_) {}
       
       const projMap: Record<string, string> = {};
       if (Array.isArray(projectsData)) {
@@ -71,7 +77,11 @@ export default function Deltas() {
     setLoadingUpdates(true);
     try {
       const res = await fetch('/api/weekly_updates');
-      setSavedUpdates(await res.json());
+      let updates = [];
+      try {
+        updates = await res.json();
+      } catch (_) {}
+      setSavedUpdates(Array.isArray(updates) ? updates : []);
     } catch (error) {
       console.error('Failed to fetch weekly updates', error);
     } finally {

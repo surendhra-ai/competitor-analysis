@@ -5,17 +5,17 @@ import {
   Database, 
   BrainCircuit, 
   CheckCircle2, 
-  XCircle, 
-  Loader2, 
+  AlertTriangle, 
   Copy, 
   Check, 
-  ExternalLink, 
-  HelpCircle, 
-  Sparkles, 
-  Terminal, 
   ChevronDown, 
   ChevronUp, 
-  AlertTriangle 
+  Loader2,
+  Sparkles,
+  XCircle,
+  Terminal,
+  RefreshCw,
+  HardDrive
 } from 'lucide-react';
 
 interface SupabaseStatus {
@@ -23,6 +23,7 @@ interface SupabaseStatus {
   connected: boolean;
   source?: string;
   url?: string;
+  localProjectCount?: number;
   tables?: {
     projects: boolean;
     project_snapshots: boolean;
@@ -33,20 +34,33 @@ interface SupabaseStatus {
   schemaSql?: string;
 }
 
-export default function SettingsPage() {
-  // Firecrawl
+async function fetchJsonSafely(res: Response) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    if (text.trim().startsWith('<')) {
+      throw new Error(`Server returned HTML error (Status ${res.status}). Verify your server routing.`);
+    }
+    throw new Error(`Failed to parse server response as JSON: ${text.slice(0, 150)}`);
+  }
+}
+
+export default function Settings() {
   const [apiKey, setApiKey] = useState('');
   
-  // Supabase
+  // Supabase Settings
   const [supabaseUrl, setSupabaseUrl] = useState('');
   const [supabaseKey, setSupabaseKey] = useState('');
   const [supabaseStatus, setSupabaseStatus] = useState<SupabaseStatus | null>(null);
   const [testingSupabase, setTestingSupabase] = useState(false);
   const [showSqlSchema, setShowSqlSchema] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<string | null>(null);
 
   // Generic LLM Configuration
-  const [llmBaseUrl, setLlmBaseUrl] = useState('https://openrouter.ai/api/v1');
+  const [llmBaseUrl, setLlmBaseUrl] = useState('');
   const [llmModel, setLlmModel] = useState('google/gemini-2.5-flash');
   const [llmApiKey, setLlmApiKey] = useState('');
   const [geminiApiKey, setGeminiApiKey] = useState('');
@@ -62,7 +76,7 @@ export default function SettingsPage() {
   useEffect(() => {
     // 1. Fetch current saved settings
     fetch('/api/settings')
-      .then(res => res.json())
+      .then(res => fetchJsonSafely(res))
       .then(data => {
         if (data.firecrawlApiKey) setApiKey(data.firecrawlApiKey);
         if (data.supabaseUrl) setSupabaseUrl(data.supabaseUrl);
@@ -97,16 +111,35 @@ export default function SettingsPage() {
     setTestingSupabase(true);
     try {
       const res = await fetch('/api/supabase/status');
-      const data = await res.json();
+      const data = await fetchJsonSafely(res);
       setSupabaseStatus(data);
     } catch (err: any) {
       setSupabaseStatus({
-        configured: true,
+        configured: false,
         connected: false,
         error: err.message || 'Network error checking Supabase connection.'
       });
     } finally {
       setTestingSupabase(false);
+    }
+  };
+
+  const handleSyncToSupabase = async () => {
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const res = await fetch('/api/supabase/sync', { method: 'POST' });
+      const data = await fetchJsonSafely(res);
+      if (data.success) {
+        setSyncResult(`Synced ${data.syncedCount} project(s) to Supabase successfully!`);
+        checkSupabaseConnection();
+      } else {
+        setSyncResult(`Sync failed: ${data.error}`);
+      }
+    } catch (err: any) {
+      setSyncResult(`Sync failed: ${err.message}`);
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -124,7 +157,7 @@ export default function SettingsPage() {
           geminiApiKey
         })
       });
-      const data = await res.json();
+      const data = await fetchJsonSafely(res);
       if (data.success) {
         setLlmTestResult({
           success: true,
@@ -211,8 +244,8 @@ export default function SettingsPage() {
                 <Database className="w-5 h-5" />
               </div>
               <div>
-                <h2 className="text-lg font-semibold text-zinc-900">Supabase Database Connection</h2>
-                <p className="text-xs text-zinc-500">Persistent storage for competitor projects, snapshots, and price history.</p>
+                <h2 className="text-lg font-semibold text-zinc-900">Database Storage (Supabase & Local SQLite)</h2>
+                <p className="text-xs text-zinc-500">Storage for competitor projects, snapshots, and price history.</p>
               </div>
             </div>
             <button
@@ -221,9 +254,22 @@ export default function SettingsPage() {
               disabled={testingSupabase}
               className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 transition-colors disabled:opacity-50"
             >
-              {testingSupabase ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Database className="w-3.5 h-3.5" />}
-              {testingSupabase ? 'Testing...' : 'Check Connection'}
+              {testingSupabase ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              {testingSupabase ? 'Testing...' : 'Check Supabase'}
             </button>
+          </div>
+
+          {/* Built-in SQLite Notice */}
+          <div className="p-3 bg-zinc-50 border border-zinc-200 rounded-xl flex items-center justify-between text-xs text-zinc-700">
+            <div className="flex items-center gap-2">
+              <HardDrive className="w-4 h-4 text-zinc-600" />
+              <span>
+                <strong>Built-in SQLite Storage:</strong> Active ({supabaseStatus?.localProjectCount ?? 0} project(s) stored locally in <code>realintel.db</code>).
+              </span>
+            </div>
+            <span className="text-[11px] font-medium text-emerald-700 bg-emerald-100/70 px-2 py-0.5 rounded-full">
+              Always Ready
+            </span>
           </div>
 
           {/* Connection Status Banner */}
@@ -243,12 +289,12 @@ export default function SettingsPage() {
                   <div className="flex items-center justify-between">
                     <p className="font-semibold text-sm">
                       {supabaseStatus.connected && supabaseStatus.tables?.projects
-                        ? 'Connected to Supabase'
+                        ? 'Supabase Cloud Database Connected'
                         : supabaseStatus.connected
                         ? 'Connected to Supabase (Tables Missing)'
-                        : 'Not Connected to Supabase'}
+                        : 'Supabase Not Connected (Using Local SQLite Database)'}
                     </p>
-                    {supabaseStatus.source && (
+                    {supabaseStatus.source && supabaseStatus.source !== 'none' && (
                       <span className="text-[11px] px-2 py-0.5 rounded-full font-mono bg-white/70 border border-zinc-200 text-zinc-600">
                         source: {supabaseStatus.source}
                       </span>
@@ -256,11 +302,11 @@ export default function SettingsPage() {
                   </div>
 
                   {supabaseStatus.connected ? (
-                    <div className="text-xs text-zinc-600 space-y-1">
+                    <div className="text-xs text-zinc-600 space-y-2">
                       <p>
                         Target URL: <code className="bg-white/80 px-1 py-0.5 rounded border border-zinc-200 font-mono text-[11px]">{supabaseStatus.url || 'Configured'}</code>
                       </p>
-                      <div className="flex flex-wrap gap-2 pt-1">
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
                         <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabaseStatus.tables?.projects ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
                           projects: {supabaseStatus.tables?.projects ? `✓ (${supabaseStatus.projectCount ?? 0} saved)` : '✗ missing'}
                         </span>
@@ -270,13 +316,30 @@ export default function SettingsPage() {
                         <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium ${supabaseStatus.tables?.weekly_deltas ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
                           weekly_deltas: {supabaseStatus.tables?.weekly_deltas ? '✓' : '✗ missing'}
                         </span>
+
+                        {supabaseStatus.tables?.projects && (
+                          <button
+                            type="button"
+                            onClick={handleSyncToSupabase}
+                            disabled={syncing}
+                            className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-semibold transition-colors disabled:opacity-50"
+                          >
+                            {syncing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                            Sync Local Projects to Supabase
+                          </button>
+                        )}
                       </div>
+                      {syncResult && (
+                        <p className="text-xs font-medium text-emerald-700 bg-white/80 p-1.5 rounded border border-emerald-200">
+                          {syncResult}
+                        </p>
+                      )}
                     </div>
                   ) : (
                     <div className="text-xs text-amber-800 space-y-1">
-                      <p><strong>Reason:</strong> {supabaseStatus.error || 'Failed to authenticate or connect.'}</p>
+                      <p><strong>Status:</strong> {supabaseStatus.error || 'All projects are currently stored in local SQLite database. Configure Supabase below to sync to the cloud.'}</p>
                       <p className="text-[11px] text-zinc-500">
-                        In Coolify: You can also set <code>SUPABASE_URL</code> and <code>SUPABASE_KEY</code> in Coolify Environment Variables.
+                        In Coolify: You can set <code>SUPABASE_URL</code> and <code>SUPABASE_KEY</code> in Coolify Environment Variables, or enter them in the form below.
                       </p>
                     </div>
                   )}
@@ -367,25 +430,23 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-                Supabase Project URL
+                Supabase Project URL (Optional)
               </label>
               <input 
                 type="text" 
-                required
                 className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none font-mono text-xs"
                 value={supabaseUrl}
                 onChange={e => setSupabaseUrl(e.target.value)}
                 placeholder="https://xxxx.supabase.co"
               />
-              <p className="mt-1 text-[11px] text-zinc-500">Found in Supabase &gt; Project Settings &gt; API</p>
+              <p className="mt-1 text-[11px] text-zinc-500">Found in Supabase &gt; Project Settings &gt; API (Leave empty to use built-in SQLite)</p>
             </div>
             <div>
               <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-                Supabase Anon / Public Key
+                Supabase Anon / Public Key (Optional)
               </label>
               <input 
                 type="password" 
-                required
                 className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none font-mono text-xs"
                 value={supabaseKey}
                 onChange={e => setSupabaseKey(e.target.value)}
@@ -452,151 +513,124 @@ CREATE POLICY "Public access to weekly_deltas" ON public.weekly_deltas FOR ALL U
             </div>
           )}
 
-          <div className="space-y-4">
-            {/* Base URL / Endpoint Field */}
+          {/* Quick Preset Buttons */}
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <span className="text-xs text-zinc-500 font-medium">Quick Presets:</span>
+            <button
+              type="button"
+              onClick={() => {
+                setLlmBaseUrl('https://openrouter.ai/api/v1');
+                setLlmModel('google/gemini-2.5-flash');
+              }}
+              className="px-2.5 py-1 text-xs bg-zinc-100 hover:bg-zinc-200 text-zinc-800 rounded-md transition-colors"
+            >
+              OpenRouter (Gemini 2.5 Flash)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLlmBaseUrl('https://openrouter.ai/api/v1');
+                setLlmModel('deepseek/deepseek-chat');
+              }}
+              className="px-2.5 py-1 text-xs bg-zinc-100 hover:bg-zinc-200 text-zinc-800 rounded-md transition-colors"
+            >
+              OpenRouter (DeepSeek V3)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLlmBaseUrl('https://api.openai.com/v1');
+                setLlmModel('gpt-4o-mini');
+              }}
+              className="px-2.5 py-1 text-xs bg-zinc-100 hover:bg-zinc-200 text-zinc-800 rounded-md transition-colors"
+            >
+              OpenAI (gpt-4o-mini)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLlmBaseUrl('https://generativelanguage.googleapis.com');
+                setLlmModel('gemini-2.5-flash');
+              }}
+              className="px-2.5 py-1 text-xs bg-zinc-100 hover:bg-zinc-200 text-zinc-800 rounded-md transition-colors"
+            >
+              Google Gemini Native
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                API Base URL / Endpoint (Text Field)
+              <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
+                API Base URL / Endpoint
               </label>
               <input 
                 type="text" 
                 className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono text-xs"
                 value={llmBaseUrl}
                 onChange={e => setLlmBaseUrl(e.target.value)}
-                placeholder="https://openrouter.ai/api/v1 (or https://api.openai.com/v1)"
+                placeholder="https://openrouter.ai/api/v1"
               />
-              <div className="flex flex-wrap items-center gap-1.5 mt-2">
-                <span className="text-[11px] text-zinc-400 mr-1">Quick Presets:</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLlmBaseUrl('https://openrouter.ai/api/v1');
-                    if (!llmModel.includes('/')) setLlmModel('google/gemini-2.5-flash');
-                  }}
-                  className="px-2 py-0.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded text-[11px] font-mono border border-zinc-200 transition-colors"
-                >
-                  OpenRouter
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLlmBaseUrl('https://api.openai.com/v1');
-                    setLlmModel('gpt-4o-mini');
-                  }}
-                  className="px-2 py-0.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded text-[11px] font-mono border border-zinc-200 transition-colors"
-                >
-                  OpenAI
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLlmBaseUrl('https://api.groq.com/openai/v1');
-                    setLlmModel('llama-3.3-70b-versatile');
-                  }}
-                  className="px-2 py-0.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded text-[11px] font-mono border border-zinc-200 transition-colors"
-                >
-                  Groq
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLlmBaseUrl('http://localhost:11434/v1');
-                    setLlmModel('llama3.2');
-                  }}
-                  className="px-2 py-0.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded text-[11px] font-mono border border-zinc-200 transition-colors"
-                >
-                  Ollama (Local)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLlmBaseUrl('https://generativelanguage.googleapis.com');
-                    setLlmModel('gemini-2.5-flash');
-                  }}
-                  className="px-2 py-0.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded text-[11px] font-mono border border-zinc-200 transition-colors"
-                >
-                  Google Gemini (Native)
-                </button>
-              </div>
+              <p className="mt-1 text-[11px] text-zinc-500">
+                Any OpenAI-compatible base URL (e.g., <code>https://openrouter.ai/api/v1</code>, <code>https://api.openai.com/v1</code>, <code>https://api.groq.com/openai/v1</code>, or <code>http://localhost:11434/v1</code>).
+              </p>
             </div>
 
-            {/* Model Name Field */}
             <div>
-              <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                Model Name (Text Field)
+              <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
+                Model Name / Identifier
               </label>
               <input 
                 type="text" 
-                required
                 className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono text-xs"
                 value={llmModel}
                 onChange={e => setLlmModel(e.target.value)}
-                placeholder="e.g. google/gemini-2.5-flash, anthropic/claude-3.5-sonnet, gpt-4o-mini"
+                placeholder="google/gemini-2.5-flash, deepseek/deepseek-chat, gpt-4o"
               />
-              <div className="flex flex-wrap items-center gap-1.5 mt-2">
-                <span className="text-[11px] text-zinc-400 mr-1">Suggestions:</span>
-                {[
-                  'google/gemini-2.5-flash',
-                  'anthropic/claude-3.5-sonnet',
-                  'meta-llama/llama-3.3-70b-instruct',
-                  'openai/gpt-4o-mini',
-                  'deepseek/deepseek-chat',
-                  'gpt-4o'
-                ].map(m => (
-                  <button
-                    key={m}
-                    type="button"
-                    onClick={() => setLlmModel(m)}
-                    className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded text-[11px] font-mono border border-blue-200 transition-colors"
-                  >
-                    {m}
-                  </button>
-                ))}
-              </div>
+              <p className="mt-1 text-[11px] text-zinc-500">
+                Any model name accepted by your provider.
+              </p>
             </div>
 
-            {/* API Key Field */}
-            <div>
-              <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                LLM API Key
+            <div className="md:col-span-2">
+              <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
+                Provider API Key
               </label>
               <input 
                 type="password" 
                 className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono text-xs"
                 value={llmApiKey}
                 onChange={e => setLlmApiKey(e.target.value)}
-                placeholder="sk-or-v1-... (OpenRouter) or sk-... (OpenAI) or AIzaSy... (Gemini)"
+                placeholder="sk-or-... / sk-..."
               />
               <p className="mt-1 text-[11px] text-zinc-500">
-                Your API key for OpenRouter, OpenAI, Groq, or whichever provider you specified above.
+                API key for your chosen Base URL (e.g. OpenRouter key, OpenAI key, Groq key, etc.).
               </p>
             </div>
+          </div>
 
-            {/* Optional Gemini Search Grounding Key */}
-            <div className="pt-2 border-t border-zinc-100">
-              <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                Google Search Grounding Key (Optional)
-              </label>
-              <input 
-                type="password" 
-                className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono text-xs"
-                value={geminiApiKey}
-                onChange={e => setGeminiApiKey(e.target.value)}
-                placeholder="Leave blank to use GEMINI_API_KEY from environment"
-              />
-              <p className="mt-1 text-[11px] text-zinc-500">
-                Powers real-time Google web search grounding for official RERA records and broker updates. If left empty, defaults to server environment variable.
-              </p>
-            </div>
+          <div className="pt-3 border-t border-zinc-100">
+            <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
+              Google Gemini API Key (Optional Search Grounding Fallback)
+            </label>
+            <input 
+              type="password" 
+              className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono text-xs"
+              value={geminiApiKey}
+              onChange={e => setGeminiApiKey(e.target.value)}
+              placeholder="AIzaSy..."
+            />
+            <p className="mt-1 text-[11px] text-zinc-500">
+              Optional: Used for Google Search Grounding to verify RERA registry filings and property portal data if the competitor website blocks crawlers.
+            </p>
           </div>
         </div>
 
         {/* ========================================================================= */}
-        {/* 3. FIRECRAWL API */}
+        {/* 3. FIRECRAWL SCRAPER */}
         {/* ========================================================================= */}
         <div className="bg-white p-6 rounded-2xl shadow-sm border border-zinc-200 space-y-4">
           <div className="flex items-center gap-3 pb-3 border-b border-zinc-100">
-            <div className="p-2 bg-orange-100 text-orange-600 rounded-lg">
+            <div className="p-2 bg-amber-100 text-amber-600 rounded-lg">
               <Key className="w-5 h-5" />
             </div>
             <div>

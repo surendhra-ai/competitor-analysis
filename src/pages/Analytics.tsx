@@ -66,8 +66,14 @@ export default function Analytics() {
         fetch('/api/projects'),
         fetch('/api/snapshots/history')
       ]);
-      const pData = await projectsRes.json();
-      const sData = await snapshotsRes.json();
+      let pData: any = [];
+      let sData: any = [];
+      try {
+        pData = await projectsRes.json();
+      } catch (_) {}
+      try {
+        sData = await snapshotsRes.json();
+      } catch (_) {}
       setProjects(Array.isArray(pData) ? pData : []);
       setSnapshots(Array.isArray(sData) ? sData : []);
     } catch (error) {

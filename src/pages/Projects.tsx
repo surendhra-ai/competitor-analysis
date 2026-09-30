@@ -11,7 +11,8 @@ import {
   CheckCircle2, 
   ExternalLink, 
   Loader2, 
-  Database 
+  Database,
+  HardDrive
 } from 'lucide-react';
 import { Link } from 'react-router';
 
@@ -29,6 +30,7 @@ interface SupabaseStatus {
   connected: boolean;
   source?: string;
   url?: string;
+  localProjectCount?: number;
   tables?: {
     projects: boolean;
     project_snapshots: boolean;
@@ -36,6 +38,18 @@ interface SupabaseStatus {
   };
   projectCount?: number;
   error?: string | null;
+}
+
+async function fetchJsonSafely(res: Response) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    if (text.trim().startsWith('<')) {
+      throw new Error(`Server returned HTML error (Status ${res.status}). Verify your server routing.`);
+    }
+    throw new Error(`Failed to parse server response as JSON: ${text.slice(0, 150)}`);
+  }
 }
 
 export default function Projects() {
@@ -53,6 +67,8 @@ export default function Projects() {
   const [bulkProgress, setBulkProgress] = useState<{ current: number, total: number, projectName: string, success: number, fail: number, isComplete: boolean } | null>(null);
 
   const [supabaseStatus, setSupabaseStatus] = useState<SupabaseStatus | null>(null);
+  const [syncingSupabase, setSyncingSupabase] = useState(false);
+  const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
 
   const [formData, setFormData] = useState({
     name: '',
@@ -69,7 +85,7 @@ export default function Projects() {
   const checkSupabaseStatus = async () => {
     try {
       const res = await fetch('/api/supabase/status');
-      const data = await res.json();
+      const data = await fetchJsonSafely(res);
       setSupabaseStatus(data);
     } catch (e) {
       console.error('Error checking Supabase status:', e);
@@ -81,7 +97,7 @@ export default function Projects() {
     setFetchError(null);
     try {
       const res = await fetch('/api/projects');
-      const data = await res.json();
+      const data = await fetchJsonSafely(res);
       if (Array.isArray(data)) {
         setProjects(data);
       } else {
@@ -94,6 +110,27 @@ export default function Projects() {
       setFetchError(error.message || 'Failed to connect to backend.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleSyncToSupabase = async () => {
+    setSyncingSupabase(true);
+    setSyncFeedback(null);
+    try {
+      const res = await fetch('/api/supabase/sync', { method: 'POST' });
+      const data = await fetchJsonSafely(res);
+      if (data.success) {
+        setSyncFeedback(`Synced ${data.syncedCount} project(s) to Supabase!`);
+        await fetchProjects();
+        await checkSupabaseStatus();
+        setTimeout(() => setSyncFeedback(null), 4000);
+      } else {
+        setSyncFeedback(`Sync error: ${data.error}`);
+      }
+    } catch (err: any) {
+      setSyncFeedback(`Sync failed: ${err.message}`);
+    } finally {
+      setSyncingSupabase(false);
     }
   };
 
@@ -112,7 +149,7 @@ export default function Projects() {
         body: JSON.stringify(formData)
       });
 
-      const data = await res.json();
+      const data = await fetchJsonSafely(res);
 
       if (!res.ok || data.error) {
         const errorMsg = data.error || `Server responded with status ${res.status}`;
@@ -138,7 +175,7 @@ export default function Projects() {
     if (!confirm('Are you sure? This will delete all historical data for this project.')) return;
     try {
       const res = await fetch(`/api/projects/${id}`, { method: 'DELETE' });
-      const data = await res.json();
+      const data = await fetchJsonSafely(res);
       if (!res.ok || data.error) {
         alert('Failed to delete project: ' + (data.error || 'Server error'));
         return;
@@ -165,7 +202,7 @@ export default function Projects() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ projectId: id })
       });
-      const data = await res.json();
+      const data = await fetchJsonSafely(res);
       if (data.error) {
         if (showAlert) alert('Scraping failed: ' + data.error);
         return false;
@@ -244,41 +281,53 @@ export default function Projects() {
     }
   };
 
-  const isSupabaseIssue = supabaseStatus && (!supabaseStatus.connected || !supabaseStatus.tables?.projects);
-
   return (
     <div className="p-8 max-w-6xl mx-auto space-y-6">
       
-      {/* Supabase Connection Warning Banner if disconnected */}
-      {isSupabaseIssue && (
-        <div className="p-4 bg-amber-50 border border-amber-300 rounded-2xl flex items-start gap-3 text-amber-900 text-sm">
-          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-          <div className="flex-1 space-y-1">
-            <h4 className="font-semibold text-amber-950">
-              {supabaseStatus?.connected
-                ? "Supabase Database Connected, but 'projects' Table is Missing"
-                : "Supabase Database is Disconnected"}
-            </h4>
-            <p className="text-xs text-amber-800 leading-relaxed">
-              {supabaseStatus?.error || "The application could not reach or query your Supabase database. Added projects cannot be saved until this is resolved."}
-            </p>
-            <div className="pt-2 flex items-center gap-3">
-              <Link 
-                to="/settings" 
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 text-white rounded-lg hover:bg-amber-700 text-xs font-semibold transition-colors"
-              >
-                <Database className="w-3.5 h-3.5" />
-                Configure Supabase & Setup SQL in Settings
-              </Link>
-              <button 
-                type="button" 
-                onClick={checkSupabaseStatus} 
-                className="text-xs font-medium text-amber-800 hover:underline"
-              >
-                Retry Check
-              </button>
+      {/* Storage & Database Status Pill Banner */}
+      <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-white border border-zinc-200 rounded-2xl shadow-sm text-xs">
+        <div className="flex items-center gap-2.5">
+          {supabaseStatus?.connected ? (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-full font-medium">
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Supabase Cloud Connected</span>
             </div>
-          </div>
+          ) : (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-50 text-blue-800 border border-blue-200 rounded-full font-medium">
+              <HardDrive className="w-3.5 h-3.5 text-blue-600" />
+              <span>Built-in Local Database Active</span>
+            </div>
+          )}
+          <span className="text-zinc-500">
+            {projects.length} project(s) ready
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {supabaseStatus?.connected && (
+            <button
+              onClick={handleSyncToSupabase}
+              disabled={syncingSupabase}
+              className="inline-flex items-center gap-1 px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
+            >
+              {syncingSupabase ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+              Sync Supabase
+            </button>
+          )}
+          <Link
+            to="/settings"
+            className="inline-flex items-center gap-1 px-2.5 py-1 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded-lg text-xs font-medium transition-colors"
+          >
+            <Database className="w-3 h-3 text-zinc-500" />
+            Database Settings
+          </Link>
+        </div>
+      </div>
+
+      {syncFeedback && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs font-medium text-emerald-800 flex items-center gap-2">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+          {syncFeedback}
         </div>
       )}
 
@@ -339,11 +388,8 @@ export default function Projects() {
             <div className="mb-4 p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
               <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
               <div className="space-y-1">
-                <p className="font-semibold text-red-950">Failed to save project to Supabase:</p>
+                <p className="font-semibold text-red-950">Failed to save project:</p>
                 <p className="font-mono text-[11px] text-red-700">{formError}</p>
-                <p className="text-[11px] text-red-600">
-                  Tip: Check your database credentials and make sure the <code>projects</code> table exists in your Supabase project (see <Link to="/settings" className="underline font-semibold">Settings</Link>).
-                </p>
               </div>
             </div>
           )}
@@ -359,265 +405,254 @@ export default function Projects() {
                 placeholder="e.g. My Home Akrida, Aparna Sarovar"
                 className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none text-sm"
                 value={formData.name}
-                onChange={e => setFormData({...formData, name: e.target.value})}
+                onChange={e => setFormData({ ...formData, name: e.target.value })}
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-zinc-700 mb-1">Location / Micro-Market</label>
+              <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                Location / Micro-market
+              </label>
               <input 
                 type="text" 
-                placeholder="e.g. Tellapur, Neopolis, Financial District"
+                placeholder="e.g. Gachibowli, Tellapur, Hyderabad"
                 className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none text-sm"
                 value={formData.location}
-                onChange={e => setFormData({...formData, location: e.target.value})}
+                onChange={e => setFormData({ ...formData, location: e.target.value })}
               />
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                Landing Page URLs (comma-separated)
-              </label>
-              <textarea 
-                rows={2}
-                placeholder="https://project-microsite.com, https://builder.com/project"
-                className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none resize-y text-xs font-mono"
-                value={formData.official_url}
-                onChange={e => setFormData({...formData, official_url: e.target.value})}
-              />
-              <p className="text-[11px] text-zinc-500 mt-1">Add project URLs or developer site links for web scraping.</p>
             </div>
             <div>
-              <label className="block text-xs font-semibold text-zinc-700 mb-1">RERA Registration Number (Optional)</label>
+              <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                Official Website URLs
+              </label>
               <input 
                 type="text" 
-                placeholder="e.g. P02400003456"
-                className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none text-sm font-mono"
-                value={formData.rera_registration_number}
-                onChange={e => setFormData({...formData, rera_registration_number: e.target.value})}
+                placeholder="https://example.com/project, https://builder.com/project"
+                className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none text-sm font-mono text-xs"
+                value={formData.official_url}
+                onChange={e => setFormData({ ...formData, official_url: e.target.value })}
               />
+              <p className="text-[11px] text-zinc-500 mt-1">Comma-separated URLs to scrape</p>
             </div>
-            <div className="md:col-span-2 flex justify-end gap-3 mt-3 pt-3 border-t border-zinc-100">
+            <div>
+              <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                RERA Registration Number
+              </label>
+              <input 
+                type="text" 
+                placeholder="P02400000000"
+                className="w-full px-3.5 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none text-sm font-mono text-xs"
+                value={formData.rera_registration_number}
+                onChange={e => setFormData({ ...formData, rera_registration_number: e.target.value })}
+              />
+              <p className="text-[11px] text-zinc-500 mt-1">Used to verify against official RERA portals</p>
+            </div>
+            <div className="md:col-span-2 flex justify-end gap-3 mt-2">
               <button 
-                type="button"
-                disabled={submitting}
+                type="button" 
                 onClick={() => {
                   setIsAdding(false);
                   setEditingId(null);
                   setFormError(null);
                 }}
-                className="px-4 py-2 text-zinc-600 hover:bg-zinc-100 rounded-lg text-xs font-medium transition-colors"
+                className="px-4 py-2 border border-zinc-300 rounded-lg text-sm font-medium hover:bg-zinc-50 transition-colors"
               >
                 Cancel
               </button>
               <button 
-                type="submit"
+                type="submit" 
                 disabled={submitting}
-                className="flex items-center gap-2 px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50 text-xs font-semibold transition-colors shadow-sm"
+                className="flex items-center gap-2 px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 text-sm font-semibold transition-colors disabled:opacity-50"
               >
-                {submitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                {submitting ? 'Saving to Supabase...' : editingId ? 'Update Project' : 'Save Project'}
+                {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
+                {editingId ? (submitting ? 'Updating...' : 'Update Project') : (submitting ? 'Saving...' : 'Save Project')}
               </button>
             </div>
           </form>
         </div>
       )}
 
-      {/* Fetch Error Banner if loading failed */}
-      {fetchError && !isSupabaseIssue && (
-        <div className="p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
-            <span>{fetchError}</span>
+      {/* Bulk Progress Banner */}
+      {bulkProgress && (
+        <div className="p-4 bg-zinc-900 text-white rounded-xl shadow-lg border border-zinc-800 flex flex-col gap-2">
+          <div className="flex justify-between items-center text-sm font-medium">
+            <span className="flex items-center gap-2">
+              {!bulkProgress.isComplete && <RefreshCw className="w-4 h-4 animate-spin text-emerald-400" />}
+              {bulkProgress.isComplete ? 'Bulk Research Finished' : `Researching: ${bulkProgress.projectName}`}
+            </span>
+            <span className="text-zinc-400 text-xs">
+              {bulkProgress.current} of {bulkProgress.total} projects
+            </span>
           </div>
-          <button 
-            onClick={fetchProjects} 
-            className="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-800 rounded font-semibold transition-colors"
-          >
-            Retry
-          </button>
-        </div>
-      )}
-
-      {/* Project Cards Grid */}
-      {loading ? (
-        <div className="flex flex-col items-center justify-center p-16 space-y-3">
-          <RefreshCw className="w-8 h-8 animate-spin text-emerald-600" />
-          <p className="text-xs text-zinc-500">Loading projects from Supabase...</p>
-        </div>
-      ) : projects.length === 0 ? (
-        <div className="bg-white p-12 rounded-2xl shadow-sm border border-zinc-200 text-center space-y-4">
-          <div className="w-12 h-12 bg-zinc-100 text-zinc-400 rounded-2xl flex items-center justify-center mx-auto">
-            <Database className="w-6 h-6" />
+          <div className="w-full bg-zinc-800 rounded-full h-2 overflow-hidden">
+            <div 
+              className="bg-emerald-500 h-full transition-all duration-300"
+              style={{ width: `${(bulkProgress.current / bulkProgress.total) * 100}%` }}
+            />
           </div>
-          <div>
-            <h3 className="text-base font-semibold text-zinc-900">No Projects Found</h3>
-            <p className="text-xs text-zinc-500 max-w-md mx-auto mt-1">
-              {isSupabaseIssue 
-                ? "Your app is not connected to a working Supabase database. Please check your Supabase URL & Anon Key in Settings." 
-                : "No competitor projects have been added yet. Click 'Add Project' to begin tracking."}
-            </p>
-          </div>
-          <div>
-            {isSupabaseIssue ? (
-              <Link
-                to="/settings"
-                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 text-xs font-semibold transition-colors"
-              >
-                Go to Settings
-              </Link>
-            ) : (
+          <div className="flex justify-between text-xs text-zinc-400">
+            <span>Successful: <strong className="text-emerald-400">{bulkProgress.success}</strong></span>
+            <span>Failed: <strong className="text-red-400">{bulkProgress.fail}</strong></span>
+            {bulkProgress.isComplete && (
               <button 
-                onClick={() => {
-                  setFormData({ name: '', location: '', official_url: '', rera_registration_number: '' });
-                  setEditingId(null);
-                  setIsAdding(true);
-                }}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-zinc-900 text-white rounded-lg hover:bg-zinc-800 text-xs font-semibold transition-colors"
+                onClick={() => setBulkProgress(null)}
+                className="text-zinc-300 hover:text-white underline"
               >
-                <Plus className="w-4 h-4" />
-                Add Your First Project
+                Dismiss
               </button>
             )}
           </div>
         </div>
-      ) : (
-        <>
-          <div className="flex items-center justify-between mb-4 px-1">
-            <label className="flex items-center gap-2 text-xs font-semibold text-zinc-700 cursor-pointer select-none">
-              <input 
-                type="checkbox" 
-                className="w-4 h-4 rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
-                checked={selectedProjects.size === projects.length && projects.length > 0}
-                onChange={toggleAll}
-              />
-              Select All ({projects.length})
-            </label>
-            <span className="text-xs text-zinc-400">
-              {projects.length} project{projects.length === 1 ? '' : 's'} tracked in Supabase
-            </span>
-          </div>
-          
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {projects.map(project => (
-              <div 
-                key={project.id} 
-                className={`bg-white p-6 rounded-2xl shadow-sm border transition-colors flex flex-col ${
-                  selectedProjects.has(project.id) ? 'border-emerald-500 ring-1 ring-emerald-500' : 'border-zinc-200'
-                }`}
-              >
-                <div className="flex justify-between items-start mb-4">
-                  <div className="flex items-start gap-3">
-                    <input 
-                      type="checkbox" 
-                      className="mt-1 w-4 h-4 rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
-                      checked={selectedProjects.has(project.id)}
-                      onChange={() => toggleProject(project.id)}
-                    />
-                    <div>
-                      <h3 className="text-base font-bold text-zinc-900 leading-tight">{project.name}</h3>
-                      <p className="text-xs text-zinc-500 mt-1">{project.location || 'Location not specified'}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <button 
-                      onClick={() => handleEditClick(project)}
-                      className="p-1.5 text-zinc-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                      title="Edit Project"
-                    >
-                      <Pencil className="w-3.5 h-3.5" />
-                    </button>
-                    <button 
-                      onClick={() => handleDelete(project.id)}
-                      className="p-1.5 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                      title="Delete Project"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </div>
-                
-                <div className="space-y-2 mb-6 flex-1 pl-7 text-xs">
-                  {project.official_url && (
-                    <div className="flex items-center gap-2 text-zinc-600">
-                      <Globe className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                      <a href={project.official_url.split(',')[0]} target="_blank" rel="noreferrer" className="hover:text-emerald-600 truncate font-mono">
-                        {project.official_url}
-                      </a>
-                    </div>
-                  )}
-                  {project.rera_registration_number && (
-                    <div className="flex items-center gap-2 text-zinc-600">
-                      <FileText className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                      <span className="truncate font-mono">RERA: {project.rera_registration_number}</span>
-                    </div>
-                  )}
-                </div>
-
-                <button 
-                  onClick={() => handleScrape(project.id)}
-                  disabled={scrapingIds.has(project.id)}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-zinc-100 text-zinc-700 rounded-lg hover:bg-zinc-200 disabled:opacity-50 text-xs font-semibold transition-colors"
-                >
-                  {scrapingIds.has(project.id) ? (
-                    <>
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      Researching...
-                    </>
-                  ) : (
-                    <>
-                      <Play className="w-3.5 h-3.5" />
-                      Run Research
-                    </>
-                  )}
-                </button>
-              </div>
-            ))}
-          </div>
-        </>
       )}
 
-      {/* Bulk Scrape Floating Widget */}
-      {bulkProgress && (
-        <div className="fixed bottom-6 right-6 bg-white p-5 rounded-2xl shadow-2xl border border-zinc-200 z-50 min-w-[340px]">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-xs font-bold text-zinc-900 flex items-center gap-2">
-              {bulkProgress.isComplete ? (
-                <span className="text-emerald-600 flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4" /> Research Complete
-                </span>
-              ) : (
-                <>
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-600" />
-                  Bulk Researching...
-                </>
-              )}
-            </h3>
-            <span className="text-xs font-medium text-zinc-500">{bulkProgress.current} / {bulkProgress.total}</span>
+      {/* Projects List */}
+      <div className="bg-white rounded-2xl shadow-sm border border-zinc-200 overflow-hidden">
+        {loading ? (
+          <div className="p-12 text-center text-zinc-500">
+            <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2 text-zinc-400" />
+            Loading tracked competitors...
           </div>
-          {!bulkProgress.isComplete && (
-            <p className="text-xs text-zinc-600 mb-3 truncate" title={bulkProgress.projectName}>
-              Processing: <span className="font-semibold">{bulkProgress.projectName}</span>
-            </p>
-          )}
-          <div className="w-full bg-zinc-100 rounded-full h-2 mb-3 overflow-hidden">
-            <div 
-              className="h-2 rounded-full transition-all duration-300 ease-out bg-emerald-500"
-              style={{ width: `${(bulkProgress.current / bulkProgress.total) * 100}%` }}
-            ></div>
-          </div>
-          <div className="flex justify-between text-xs font-medium mb-3">
-            <span className="text-emerald-600">Success: {bulkProgress.success}</span>
-            <span className="text-red-600">Failed: {bulkProgress.fail}</span>
-          </div>
-          {bulkProgress.isComplete && (
+        ) : fetchError ? (
+          <div className="p-8 text-center text-red-600 bg-red-50/50">
+            <AlertTriangle className="w-6 h-6 mx-auto mb-2 text-red-500" />
+            <p className="font-semibold text-sm">Failed to load projects</p>
+            <p className="text-xs text-red-500 mt-1">{fetchError}</p>
             <button
-              onClick={() => setBulkProgress(null)}
-              className="w-full py-2 bg-zinc-100 text-zinc-700 rounded-lg hover:bg-zinc-200 text-xs font-medium transition-colors"
+              onClick={fetchProjects}
+              className="mt-3 px-3 py-1 bg-red-100 hover:bg-red-200 text-red-800 rounded-lg text-xs font-medium"
             >
-              Close
+              Retry
             </button>
-          )}
-        </div>
-      )}
+          </div>
+        ) : projects.length === 0 ? (
+          <div className="p-12 text-center text-zinc-500 space-y-3">
+            <div className="w-12 h-12 rounded-full bg-zinc-100 flex items-center justify-center mx-auto text-zinc-400">
+              <Database className="w-6 h-6" />
+            </div>
+            <div>
+              <p className="font-semibold text-zinc-800">No competitor projects tracked yet</p>
+              <p className="text-xs text-zinc-400 mt-1">Add your first project to start automated price and construction tracking.</p>
+            </div>
+            <button
+              onClick={() => {
+                setFormData({ name: '', location: '', official_url: '', rera_registration_number: '' });
+                setEditingId(null);
+                setIsAdding(true);
+              }}
+              className="inline-flex items-center gap-1.5 px-4 py-2 bg-zinc-900 text-white rounded-lg hover:bg-zinc-800 text-xs font-semibold"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add First Project
+            </button>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-zinc-100 bg-zinc-50/75 text-zinc-500 text-xs font-semibold">
+                  <th className="py-3 px-4 w-10 text-center">
+                    <input 
+                      type="checkbox"
+                      className="rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500"
+                      checked={projects.length > 0 && selectedProjects.size === projects.length}
+                      onChange={toggleAll}
+                    />
+                  </th>
+                  <th className="py-3 px-4">Project Name</th>
+                  <th className="py-3 px-4">Location</th>
+                  <th className="py-3 px-4">Official URLs</th>
+                  <th className="py-3 px-4">RERA Number</th>
+                  <th className="py-3 px-4 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-100">
+                {projects.map((project) => {
+                  const isScraping = scrapingIds.has(project.id);
+                  const isSelected = selectedProjects.has(project.id);
+                  const urls = (project.official_url || '').split(',').map(u => u.trim()).filter(Boolean);
+
+                  return (
+                    <tr key={project.id} className={`hover:bg-zinc-50/50 transition-colors ${isSelected ? 'bg-emerald-50/20' : ''}`}>
+                      <td className="py-3.5 px-4 text-center">
+                        <input 
+                          type="checkbox"
+                          className="rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500"
+                          checked={isSelected}
+                          onChange={() => toggleProject(project.id)}
+                        />
+                      </td>
+                      <td className="py-3.5 px-4 font-semibold text-zinc-900">
+                        {project.name}
+                      </td>
+                      <td className="py-3.5 px-4 text-zinc-600 text-xs">
+                        {project.location || <span className="text-zinc-400 italic">Not set</span>}
+                      </td>
+                      <td className="py-3.5 px-4">
+                        {urls.length > 0 ? (
+                          <div className="flex flex-wrap gap-1.5">
+                            {urls.map((u, i) => (
+                              <a 
+                                key={i}
+                                href={u} 
+                                target="_blank" 
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] bg-zinc-100 text-zinc-700 hover:bg-zinc-200 transition-colors"
+                              >
+                                <Globe className="w-3 h-3 text-zinc-400" />
+                                {new URL(u).hostname.replace('www.', '')}
+                                <ExternalLink className="w-2.5 h-2.5 text-zinc-400" />
+                              </a>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-zinc-400 text-xs italic">No URLs</span>
+                        )}
+                      </td>
+                      <td className="py-3.5 px-4 font-mono text-xs text-zinc-600">
+                        {project.rera_registration_number ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-purple-50 text-purple-700 rounded border border-purple-100">
+                            <FileText className="w-3 h-3" />
+                            {project.rera_registration_number}
+                          </span>
+                        ) : (
+                          <span className="text-zinc-400 italic font-sans">None</span>
+                        )}
+                      </td>
+                      <td className="py-3.5 px-4 text-right">
+                        <div className="flex items-center justify-end gap-1.5">
+                          <button
+                            onClick={() => handleScrape(project.id)}
+                            disabled={isScraping}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
+                            title="Scrape & Run AI Intelligence Extraction"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${isScraping ? 'animate-spin' : ''}`} />
+                            {isScraping ? 'Analyzing...' : 'Research'}
+                          </button>
+                          <button
+                            onClick={() => handleEditClick(project)}
+                            className="p-1.5 hover:bg-zinc-100 text-zinc-500 hover:text-zinc-800 rounded-lg transition-colors"
+                            title="Edit project details"
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => handleDelete(project.id)}
+                            className="p-1.5 hover:bg-red-50 text-zinc-400 hover:text-red-600 rounded-lg transition-colors"
+                            title="Delete project"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
     </div>
   );
 }
